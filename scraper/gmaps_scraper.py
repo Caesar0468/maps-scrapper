@@ -5,6 +5,7 @@ import json
 import random
 import re
 import time
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,53 +25,71 @@ PHONE_RE = re.compile(r"(?:\+91[\s-]?)?(?:\(?0?\d{2,4}\)?[\s-]?)?\d{4}[\s-]?\d{4
 def random_delay(min_s: float = 0.4, max_s: float = 0.8) -> None:
     time.sleep(random.uniform(min_s, max_s))
 
-def dismiss_overlays(page: Page) -> None:
-    try:
-        close_drawer = page.locator('button[aria-label="Close"], button[jsaction*="drawer.close"]').first
-        if close_drawer.is_visible(timeout=500):
-            close_drawer.click()
-    except Exception:
-        pass
-    for text in ("Accept all", "Reject all", "I agree", "Agree"):
+def dismiss_cookie_banners(page: Page) -> None:
+    """Dismiss cookie consent and sign-in prompts, but NOT generic close buttons."""
+    for text in ("Accept all", "Reject all", "I agree", "Agree", "Not now", "Maybe later"):
         try:
             btn = page.locator(f'button:has-text("{text}")').first
             if btn.is_visible(timeout=500):
-                btn.click()
+                btn.click(timeout=1000)
                 random_delay(0.2, 0.4)
                 break
         except Exception:
             pass
 
-def parse_review_count(text: str) -> int | None:
-    if not text:
-        return None
-    cleaned = text.replace("\u00a0", " ").replace("\u202f", " ").replace("(", "").replace(")", "").strip()
-    match = REVIEW_COUNT_RE.search(cleaned)
-    if not match:
-        digits = re.search(r"\b([\d,]+)\b", cleaned)
-        if digits:
-            try:
-                return int(digits.group(1).replace(",", ""))
-            except ValueError:
-                return None
-        return None
-    raw = match.group(1).replace(",", "")
-    suffix = (match.group(2) or "").upper()
-    try:
-        val = float(raw)
-        if suffix == "K":
-            val *= 1000
-        elif suffix == "M":
-            val *= 1_000_000
-        return int(val)
-    except ValueError:
-        return None
+def dismiss_overlays(page: Page, allow_close_drawer: bool = True) -> None:
+    """Dismiss common Google Maps popups. If allow_close_drawer is True, also close any open drawer."""
+    if allow_close_drawer:
+        try:
+            close_btn = page.locator('button[aria-label="Close"], button[jsaction*="drawer.close"]').first
+            if close_btn.is_visible(timeout=500):
+                close_btn.click(timeout=1000)
+                random_delay(0.2, 0.4)
+        except Exception:
+            pass
+    dismiss_cookie_banners(page)
 
 def parse_rating(text: str) -> float | None:
     if not text:
         return None
     match = RATING_RE.search(text)
     return float(match.group(1)) if match else None
+
+def parse_review_count(text: str) -> int | None:
+    """Parse review count from text like '1,234 reviews' or '(1,234)'."""
+    if not text:
+        return None
+    # First try pattern like "1,234 reviews"
+    cleaned = text.replace("\u00a0", " ").replace("\u202f", " ")
+    match = re.search(r"\b([\d,]+)\s*reviews?\b", cleaned, re.IGNORECASE)
+    if match:
+        return int(match.group(1).replace(",", ""))
+    # Then try pattern like "(1,234)" after a rating
+    match = re.search(r"\b\d\.\d\s*\(([\d,]+)\)", cleaned)
+    if match:
+        return int(match.group(1).replace(",", ""))
+    # Finally, try any parenthesized number with comma
+    match = re.search(r"\(([\d,]+)\)", cleaned)
+    if match:
+        return int(match.group(1).replace(",", ""))
+    return None
+
+def extract_rating_reviews(text: str) -> tuple[float | None, int | None]:
+    """Extract rating and review count from a block of text.
+    Handles both '4.5(12,237)' and '4.5 (12,237 reviews)' formats.
+    """
+    if not text:
+        return None, None
+    # Pattern: "4.5(12,237)"
+    match = re.search(r"(\d\.\d)\s*\(([\d,]+)\)", text)
+    if match:
+        rating = float(match.group(1))
+        reviews = int(match.group(2).replace(",", ""))
+        return rating, reviews
+    # Fallback: separate rating and review count
+    rating = parse_rating(text)
+    reviews = parse_review_count(text)
+    return rating, reviews
 
 def extract_coordinates(url: str, fallback: tuple[float, float]) -> tuple[float, float]:
     if not url:
@@ -95,89 +114,101 @@ def dedupe_key(name: str, place_id: str | None, lat: float, lng: float) -> str:
         return f"id:{place_id}"
     return f"coord:{name.strip().lower()}:{round(lat,4)}:{round(lng,4)}"
 
-def scroll_feed(page: Page, max_scrolls: int = 25) -> None:
-    feed = page.locator('div[role="feed"], div[aria-label*="Results"], .m6QErb[aria-label]').first
-    if feed.count() == 0:
-        return
+def scroll_feed(page: Page, max_scrolls: int = 20, max_time: float = 12.0) -> None:
+    """Scroll to load more results."""
+    start_time = time.time()
+    last_count = 0
+    stagnant = 0
 
-    last_card_count = 0
-    stagnant_count = 0
-
-    for _ in range(max_scrolls):
+    for i in range(max_scrolls):
+        if time.time() - start_time > max_time:
+            break
+        # Scroll the feed container
         try:
-            end_msg = page.locator('text="You\'ve reached the end of the list"').first
-            if end_msg.is_visible(timeout=300):
+            feed = page.locator('div[role="feed"]').first
+            if feed.count() > 0:
+                feed.evaluate("el => el.scrollTop = el.scrollHeight")
+            else:
+                page.mouse.wheel(0, 2000)
+        except Exception:
+            page.mouse.wheel(0, 2000)
+        random_delay(0.5, 0.8)
+
+        # Count current articles
+        try:
+            current = page.locator('div[role="article"]').count()
+        except Exception:
+            current = last_count
+        if current == last_count:
+            stagnant += 1
+            if stagnant >= 3:
+                break
+        else:
+            stagnant = 0
+        last_count = current
+
+        # End of list check
+        try:
+            if page.locator('text="You\'ve reached the end of the list"').is_visible(timeout=500):
                 break
         except Exception:
             pass
 
-        cards = page.locator('div.Nv2PK')
-        current_count = cards.count()
-
-        if current_count == last_card_count:
-            stagnant_count += 1
-            if stagnant_count >= 3:
-                break
-        else:
-            stagnant_count = 0
-
-        last_card_count = current_count
-
-        try:
-            feed.evaluate("el => el.scrollBy(0, 5000)")
-            random_delay(0.4, 0.7)
-        except Exception:
-            break
-
 def parse_list_cards(page: Page, locality: str, fallback: tuple[float, float]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    cards = page.locator('div.Nv2PK, div[role="feed"] > div > div[jsaction]')
-    count = cards.count()
+    """Parse restaurant cards from current page."""
+    results = []
+    # Primary: article elements
+    article_selector = 'div[role="article"]'
+    try:
+        articles = page.locator(article_selector)
+        count = articles.count()
+        print(f"    Articles found: {count}")
+        for i in range(count):
+            try:
+                article = articles.nth(i)
+                # Get the link to the place
+                link = article.locator('a[href*="/maps/place/"]').first
+                if link.count() == 0:
+                    link = article.locator('a').first
+                if link.count() == 0:
+                    continue
+                href = link.get_attribute("href") or ""
+                if not href.startswith("http"):
+                    href = f"https://www.google.com{href}"
 
-    for i in range(count):
-        try:
-            card = cards.nth(i)
-            link = card.locator('a.hfpxzc, a[href*="/maps/place/"]').first
-            if link.count() == 0:
-                continue
+                # Extract full text of the article
+                text = article.inner_text(timeout=2000)
+                if not text:
+                    continue
 
-            href = link.get_attribute("href") or ""
-            if not href.startswith("http"):
-                href = f"https://www.google.com{href}"
+                # Use combined extractor for rating and review count
+                rating, reviews = extract_rating_reviews(text)
+                if rating is None or reviews is None:
+                    # Fallback to specific elements
+                    try:
+                        rating_el = article.locator('span[aria-hidden="true"]').first
+                        if rating_el.count() > 0:
+                            rating = parse_rating(rating_el.inner_text(timeout=500))
+                    except Exception:
+                        pass
+                    try:
+                        review_el = article.locator('span[aria-label*="reviews"]').first
+                        if review_el.count() > 0:
+                            reviews = parse_review_count(review_el.inner_text(timeout=500))
+                    except Exception:
+                        pass
 
-            name = ""
-            name_el = card.locator('.qBF1Pd, .fontHeadlineSmall, [class*="fontHeadline"]').first
-            if name_el.count() > 0:
-                name = name_el.inner_text(timeout=400).strip()
-            if not name:
-                aria = link.get_attribute("aria-label") or ""
-                name = aria.split("\n")[0].strip()
-            if not name:
-                continue
+                if rating is None or reviews is None:
+                    continue
+                if rating < MIN_RATING or reviews < MIN_REVIEWS:
+                    continue
 
-            card_text = card.inner_text(timeout=400)
-            rating = None
-            rating_el = card.locator('span.MW4etd, span.ZkP5Je').first
-            if rating_el.count() > 0:
-                rating = parse_rating(rating_el.inner_text(timeout=200))
-            if rating is None:
-                rating = parse_rating(card_text)
+                # Name is typically the first non-empty line
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                name = lines[0] if lines else "Unknown"
 
-            reviews = None
-            review_el = card.locator('span.UY7F9, span.RDAAZb').first
-            if review_el.count() > 0:
-                reviews = parse_review_count(review_el.inner_text(timeout=200))
-            if reviews is None:
-                reviews = parse_review_count(card_text)
-
-            if rating is None or reviews is None:
-                continue
-            if rating < MIN_RATING or reviews < MIN_REVIEWS:
-                continue
-
-            lat, lng = extract_coordinates(href, fallback)
-            results.append(
-                {
+                lat, lng = extract_coordinates(href, fallback)
+                results.append({
                     "name": name,
                     "rating": rating,
                     "review_count": reviews,
@@ -186,12 +217,60 @@ def parse_list_cards(page: Page, locality: str, fallback: tuple[float, float]) -
                     "longitude": lng,
                     "google_maps_url": href,
                     "place_id": extract_place_id(href),
-                }
-            )
-        except Exception:
-            continue
+                })
+            except Exception as e:
+                print(f"    Error parsing article {i}: {e}")
+                continue
+    except Exception as e:
+        print(f"    Error with article selector: {e}")
 
-    return results
+    # If no results, try alternative selectors (fallback)
+    if not results:
+        print("    No results from articles, trying fallback selectors...")
+        alt_selectors = ['div.Nv2PK', 'div[role="feed"] > div > div']
+        for selector in alt_selectors:
+            try:
+                items = page.locator(selector)
+                count = items.count()
+                print(f"    Selector '{selector}' count: {count}")
+                for i in range(count):
+                    item = items.nth(i)
+                    link = item.locator('a[href*="/maps/place/"]').first
+                    if link.count() == 0:
+                        continue
+                    href = link.get_attribute("href") or ""
+                    if not href.startswith("http"):
+                        href = f"https://www.google.com{href}"
+                    text = item.inner_text(timeout=1000)
+                    rating, reviews = extract_rating_reviews(text)
+                    if rating is None or reviews is None:
+                        continue
+                    if rating < MIN_RATING or reviews < MIN_REVIEWS:
+                        continue
+                    name = text.split('\n')[0].strip() if text else ""
+                    lat, lng = extract_coordinates(href, fallback)
+                    results.append({
+                        "name": name,
+                        "rating": rating,
+                        "review_count": reviews,
+                        "locality": locality,
+                        "latitude": lat,
+                        "longitude": lng,
+                        "google_maps_url": href,
+                        "place_id": extract_place_id(href),
+                    })
+            except Exception as e:
+                print(f"    Error with fallback selector '{selector}': {e}")
+
+    # Deduplicate
+    unique = []
+    seen_keys = set()
+    for r in results:
+        key = dedupe_key(r["name"], r.get("place_id"), r["latitude"], r["longitude"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique.append(r)
+    return unique
 
 def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]:
     url = listing["google_maps_url"]
@@ -202,7 +281,7 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        dismiss_overlays(page)
+        dismiss_overlays(page)  # allow closing drawer if needed
         random_delay(0.4, 0.7)
     except Exception as exc:
         result["scrape_error"] = str(exc)
@@ -271,6 +350,10 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
                 if row_text and len(row_text) < 80:
                     hours.append(row_text)
             metadata_sources["opening_hours"] = {"value": hours, "source": "Google Maps Hours Panel"}
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -291,16 +374,16 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
     return result
 
 def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, Any]]:
-    name = str(target["name"])
-    lat, lon = float(target["lat"]), float(target["lon"])
-    query_str = f"restaurants near {name}, Hyderabad"
+    query_str = str(target.get("query") or f"restaurants near {target['name']}, Hyderabad")
     url = f"https://www.google.com/maps/search/{quote_plus(query_str)}"
-    print(f"\n📍 Scanning {target['type']}: {name}")
+    print(f"\n📍 Scanning {target['type']}: {target['name']}")
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=35000)
-        dismiss_overlays(page)
-        random_delay(0.8, 1.4)
+        # Only dismiss cookie banners, do NOT close drawer (would close results)
+        dismiss_cookie_banners(page)
+        time.sleep(1.5)
+        dismiss_cookie_banners(page)
 
         # Handle Locality Page redirect: Click "Nearby restaurants" chip if present
         if "/maps/place/" in page.url:
@@ -308,57 +391,46 @@ def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, 
                 try:
                     chip = page.locator(f'button:has-text("{chip_text}")').first
                     if chip.is_visible(timeout=1500):
-                        chip.click()
+                        chip.click(timeout=2000)
                         random_delay(1.0, 1.6)
                         break
                 except Exception:
                     pass
 
-        feed_selector = 'div.Nv2PK, div[role="feed"], div[aria-label*="Results"]'
-        feed_found = False
-
+        # Wait for at least one article result
         try:
-            page.wait_for_selector(feed_selector, timeout=8000)
-            feed_found = True
-        except Exception:
-            search_box = page.locator('input#searchboxinput, input[name="q"]').first
-            if search_box.is_visible(timeout=2000):
-                search_box.click()
-                search_box.fill(query_str)
-                search_box.press("Enter")
-                random_delay(1.2, 1.8)
-                try:
-                    page.wait_for_selector(feed_selector, timeout=8000)
-                    feed_found = True
-                except Exception:
-                    feed_found = False
-
-        if not feed_found:
-            print(f"  ⚠️ No feed found for {name}")
+            page.wait_for_selector('div[role="article"]', timeout=20000, state="visible")
+            print("    Results loaded.")
+        except PlaywrightTimeout:
+            print("    ⚠️ No articles found after 20s. Possibly no results for this query.")
             return []
 
+        # Scroll to load more
+        scroll_feed(page, max_scrolls=20, max_time=12.0)
+
+        locality_for_card = str(target["name"]) if target.get("type") == "locality" else ""
+
+        listings = parse_list_cards(page, locality_for_card, (float(target["lat"]), float(target["lon"])))
+        print(f"  ↳ Found {len(listings)} qualifying places (4.0+ ★ & 1K+ reviews)")
+
+        detailed: list[dict[str, Any]] = []
+        for idx, listing in enumerate(listings, start=1):
+            print(f"    [{idx}/{len(listings)}] Details: {listing['name']} ({listing['rating']}★, {listing['review_count']:,} reviews)...")
+            try:
+                detailed.append(extract_place_details(page, listing))
+                random_delay(0.3, 0.6)
+            except Exception as exc:
+                listing["scrape_error"] = str(exc)
+                detailed.append(listing)
+
+        return detailed
+
     except PlaywrightTimeout:
-        print(f"  ⚠️ Timeout loading feed for: {name}")
+        print(f"  ⚠️ Timeout loading feed for: {target['name']}")
         return []
     except Exception as exc:
-        print(f"  ⚠️ Error on {name}: {exc}")
+        print(f"  ⚠️ Error on {target['name']}: {exc}")
         return []
-
-    scroll_feed(page, max_scrolls=25)
-    listings = parse_list_cards(page, name, (lat, lon))
-    print(f"  ↳ Found {len(listings)} qualifying places (4.0+ ★ & 1K+ reviews)")
-
-    detailed: list[dict[str, Any]] = []
-    for idx, listing in enumerate(listings, start=1):
-        print(f"    [{idx}/{len(listings)}] Details: {listing['name']} ({listing['rating']}★, {listing['review_count']:,} reviews)...")
-        try:
-            detailed.append(extract_place_details(page, listing))
-            random_delay(0.3, 0.6)
-        except Exception as exc:
-            listing["scrape_error"] = str(exc)
-            detailed.append(listing)
-
-    return detailed
 
 def run_scraper(
     max_targets: int | None = None,
@@ -372,8 +444,10 @@ def run_scraper(
     seen: set[str] = set()
     all_places: list[dict[str, Any]] = []
 
+    headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=headless)
         context = browser.new_context(
             viewport={"width": 1366, "height": 768},
             locale="en-IN",
@@ -383,7 +457,7 @@ def run_scraper(
         # Warm-up navigation
         try:
             page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=20000)
-            dismiss_overlays(page)
+            dismiss_cookie_banners(page)
             random_delay(0.8, 1.2)
         except Exception:
             pass

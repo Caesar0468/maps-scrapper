@@ -1,0 +1,10 @@
+/* Minimal custom styles – Tailwind handles most */
+#map {
+    width: 100%;
+    height: 100%;
+}
+.dist-chip.active {
+    background-color: #1e293b;
+    color: white;
+    border-color: #1e293b;
+}

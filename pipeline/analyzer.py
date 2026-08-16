@@ -78,7 +78,8 @@ def _build_prompt(restaurant: dict[str, Any], social_context: dict[str, Any] | N
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    text = text.strip()
+    # Remove thinking tags (common in reasoning models)
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)

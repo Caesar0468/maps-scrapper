@@ -6,14 +6,13 @@ from __future__ import annotations
 import csv
 import io
 import json
-import math
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -44,7 +43,6 @@ async def index(request: Request):
     conn = get_db()
     localities = db.get_localities(conn)
     conn.close()
-    # FIX: request must be first argument
     return TEMPLATES.TemplateResponse(request, "index.html", {"localities": localities})
 
 
@@ -60,7 +58,6 @@ async def restaurant_profile(request: Request, slug: str):
     wa_url = whatsapp_share_url(restaurant)
     wa_text = whatsapp_share_text(restaurant)
 
-    # FIX: request must be first argument
     return TEMPLATES.TemplateResponse(
         request,
         "restaurant.html",
@@ -80,10 +77,13 @@ def _apply_filters(
     locality: str = "",
     cuisine: str = "",
     open_now: bool = False,
+    late_night: bool = False,
     pure_veg: bool = False,
     avoid_veg: bool = False,
     avoid_nonveg: bool = False,
     hype: str = "",
+    fake_risk: str = "",
+    dietary: str = "",
     low_fake_risk: bool = False,
     budget_min: int = 0,
     budget_max: int = 50000,
@@ -109,12 +109,17 @@ def _apply_filters(
         if locality and r.get("locality") != locality:
             continue
 
+        # Cuisine: split comma-separated values
         if cuisine:
-            cuisines = [c.lower() for c in ai.get("cuisines", [])]
-            if cuisine.lower() not in cuisines:
+            requested_cuisines = [c.strip().lower() for c in cuisine.split(",") if c.strip()]
+            rest_cuisines = [c.lower() for c in ai.get("cuisines", [])]
+            if requested_cuisines and not any(req in rest_cuisines for req in requested_cuisines):
                 continue
 
         if open_now and not r.get("is_open_now"):
+            continue
+
+        if late_night and not ai.get("open_late_night"):
             continue
 
         if pure_veg and not ai.get("is_pure_veg"):
@@ -129,28 +134,44 @@ def _apply_filters(
         if hype and ai.get("hype_verdict") != hype:
             continue
 
+        if fake_risk and ai.get("fake_review_risk") != fake_risk:
+            continue
+
+        if dietary and ai.get("dietary_suitability") != dietary:
+            continue
+
+        # NEW: low_fake_risk filter
         if low_fake_risk and ai.get("fake_review_risk") != "Low":
             continue
 
-        # FIX: budget filter – always apply range; missing spend defaults to 0
+        # Spend
         spend = ai.get("calculated_spend_for_two", 0) or 0
         if spend < budget_min or spend > budget_max:
             continue
 
+        # Vibe: split comma-separated values
         if vibe:
-            tags = [t.lower() for t in ai.get("vibe_tags", [])]
-            if vibe.lower() not in " ".join(tags):
+            requested_vibes = [v.strip().lower() for v in vibe.split(",") if v.strip()]
+            rest_vibes = [v.lower() for v in ai.get("vibe_tags", [])]
+            if requested_vibes and not any(req in rest_vibes for req in requested_vibes):
                 continue
 
-        if lat is not None and lon is not None and radius_km is not None:
+        # Distance calculation: always compute if lat/lon are provided
+        if lat is not None and lon is not None:
             rlat, rlon = r.get("latitude"), r.get("longitude")
             if rlat and rlon:
                 dist = haversine_km(lat, lon, rlat, rlon)
                 r["distance_km"] = round(dist, 2)
-                if dist > radius_km:
+                # Only filter by distance if radius_km is explicitly given
+                if radius_km is not None and dist > radius_km:
                     continue
             else:
-                continue
+                # If coordinates missing and radius filter is active, skip
+                if radius_km is not None:
+                    continue
+        elif radius_km is not None:
+            # radius without lat/lon is meaningless
+            pass
 
         r["_ai"] = ai
         results.append(r)
@@ -164,10 +185,13 @@ async def api_restaurants(
     locality: str = Query(""),
     cuisine: str = Query(""),
     open_now: bool = Query(False),
+    late_night: bool = Query(False),
     pure_veg: bool = Query(False),
     exclude_avoid_veg: bool = Query(False),
     exclude_avoid_nonveg: bool = Query(False),
     hype: str = Query(""),
+    fake_risk: str = Query(""),
+    dietary: str = Query(""),
     low_fake_risk: bool = Query(False),
     budget_min: int = Query(0),
     budget_max: int = Query(50000),
@@ -187,10 +211,13 @@ async def api_restaurants(
         locality=locality,
         cuisine=cuisine,
         open_now=open_now,
+        late_night=late_night,
         pure_veg=pure_veg,
         avoid_veg=exclude_avoid_veg,
         avoid_nonveg=exclude_avoid_nonveg,
         hype=hype,
+        fake_risk=fake_risk,
+        dietary=dietary,
         low_fake_risk=low_fake_risk,
         budget_min=budget_min,
         budget_max=budget_max,
@@ -208,6 +235,8 @@ async def api_restaurants(
         filtered.sort(key=lambda x: x.get("distance_km", 9999))
     elif sort == "hype":
         filtered.sort(key=lambda x: -(x.get("_ai", {}).get("hype_score", 0)))
+    elif sort == "spend":
+        filtered.sort(key=lambda x: x.get("_ai", {}).get("calculated_spend_for_two", 99999))
     else:
         filtered.sort(key=lambda x: (-(x.get("review_count") or 0), -(x.get("rating") or 0)))
 
@@ -284,12 +313,19 @@ async def run_pipeline_api(
     max_targets: int = Query(5, ge=1, le=500),
     skip_scrape: bool = Query(False),
 ):
+    global _pipeline_state
+    if not _pipeline_lock.acquire(blocking=False):
+        return JSONResponse({"message": "Pipeline already starting or running"}, status_code=409)
+
     if _pipeline_state["running"]:
+        _pipeline_lock.release()
         return JSONResponse({"message": "Pipeline already running"}, status_code=409)
+
+    _pipeline_state = {"running": True, "stage": "starting", "progress": {}}
+    _pipeline_lock.release()
 
     def _run():
         global _pipeline_state
-        _pipeline_state = {"running": True, "stage": "starting", "progress": {}}
         try:
             from run_pipeline import run_full_pipeline
             run_full_pipeline(
@@ -303,16 +339,25 @@ async def run_pipeline_api(
         finally:
             _pipeline_state["running"] = False
 
-    # FIX: Acquire lock and check again to avoid race condition
-    if _pipeline_lock.acquire(blocking=False):
-        threading.Thread(target=_run, daemon=True).start()
-        _pipeline_lock.release()
-        return JSONResponse({"message": "Pipeline started", "status": _pipeline_state})
-    else:
-        return JSONResponse({"message": "Pipeline already starting"}, status_code=409)
+    threading.Thread(target=_run, daemon=True).start()
+    return JSONResponse({"message": "Pipeline started", "status": _pipeline_state})
 
 
-# Make static mount safe – skip if directory doesn't exist (optional)
+@app.get("/api/cuisines")
+async def api_cuisines():
+    conn = get_db()
+    cuisines = db.get_distinct_cuisines(conn)
+    conn.close()
+    return JSONResponse({"cuisines": cuisines})
+
+@app.get("/api/vibes")
+async def api_vibes():
+    conn = get_db()
+    vibes = db.get_distinct_vibes(conn)
+    conn.close()
+    return JSONResponse({"vibes": vibes})
+
+# Static mount
 static_dir = BASE_DIR / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

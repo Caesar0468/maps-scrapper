@@ -68,13 +68,12 @@ def init_db(db_path: Path | None = None) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_restaurants_slug ON restaurants(slug);
         CREATE INDEX IF NOT EXISTS idx_restaurants_coords ON restaurants(latitude, longitude);
 
-        -- FIX: Removed content and content_rowid – we sync manually via _fts_sync
         CREATE VIRTUAL TABLE IF NOT EXISTS restaurants_fts USING fts5(
             name,
             locality,
             cuisines,
             must_try_items,
-            tokenize='porter unicode61'
+            tokenize='porter'
         );
         """
     )
@@ -113,6 +112,13 @@ def upsert_restaurant(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
     social = data.get("social_context")
     social_json = json.dumps(social) if social else data.get("social_context_json")
 
+    # Fix double serialization: only convert to JSON string if not already a string
+    raw_menu = data.get("raw_menu") or data.get("raw_menu_json") or []
+    raw_menu_json = raw_menu if isinstance(raw_menu, str) else json.dumps(raw_menu)
+
+    menu_images = data.get("menu_images") or data.get("menu_images_json") or []
+    menu_images_json = menu_images if isinstance(menu_images, str) else json.dumps(menu_images)
+
     existing = conn.execute("SELECT id FROM restaurants WHERE slug=? OR place_id=?",
                             (slug, data.get("place_id"))).fetchone()
 
@@ -132,10 +138,10 @@ def upsert_restaurant(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
         "google_maps_url": data.get("google_maps_url"),
         "opening_hours_json": json.dumps(data.get("opening_hours") or []),
         "is_open_now": 1 if data.get("is_open_now") else 0 if data.get("is_open_now") is False else None,
-        "raw_menu_json": json.dumps(data.get("raw_menu") or data.get("raw_menu_json") or []),
+        "raw_menu_json": raw_menu_json,
         "menu_source": data.get("menu_source"),
         "qr_menu_url": data.get("qr_menu_url"),
-        "menu_images_json": json.dumps(data.get("menu_images") or []),
+        "menu_images_json": menu_images_json,
         "metadata_sources_json": json.dumps(metadata),
         "social_context_json": social_json,
         "ai_analysis_json": ai_json,
@@ -167,19 +173,22 @@ def upsert_restaurant(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
-    for key in (
+    json_keys = (
         "opening_hours_json",
         "raw_menu_json",
         "menu_images_json",
         "metadata_sources_json",
         "social_context_json",
         "ai_analysis_json",
-    ):
-        if d.get(key):
+    )
+    for key in json_keys:
+        if key in d:
+            raw = d.pop(key)
+            clean_key = key.replace("_json", "")
             try:
-                d[key.replace("_json", "")] = json.loads(d[key])
+                d[clean_key] = json.loads(raw) if raw else None
             except json.JSONDecodeError:
-                d[key.replace("_json", "")] = None
+                d[clean_key] = None
     if d.get("is_open_now") is not None:
         d["is_open_now"] = bool(d["is_open_now"])
     return d
@@ -196,22 +205,29 @@ def get_restaurant_by_slug(conn: sqlite3.Connection, slug: str) -> dict[str, Any
 
 
 def search_restaurants(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[dict[str, Any]]:
-    # FIX: use alias 'fts' instead of table name
-    rows = conn.execute(
-        """
-        SELECT r.* FROM restaurants r
-        JOIN restaurants_fts fts ON r.id = fts.rowid
-        WHERE fts MATCH ?
-        ORDER BY rank LIMIT ?
-        """,
-        (query, limit),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT r.* FROM restaurants r
+            JOIN restaurants_fts fts ON r.id = fts.rowid
+            WHERE fts MATCH ?
+            ORDER BY rank LIMIT ?
+            """,
+            (query, limit),
+        ).fetchall()
+    except sqlite3.Error:
+        # Fallback to simple LIKE search if FTS query fails
+        like_query = f"%{query}%"
+        rows = conn.execute(
+            "SELECT * FROM restaurants WHERE name LIKE ? OR locality LIKE ? ORDER BY review_count DESC LIMIT ?",
+            (like_query, like_query, limit),
+        ).fetchall()
     return [row_to_dict(r) for r in rows]
 
 
 def get_localities(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
-        "SELECT DISTINCT locality FROM restaurants WHERE locality IS NOT NULL ORDER BY locality"
+        "SELECT DISTINCT locality FROM restaurants WHERE locality IS NOT NULL AND locality != '' ORDER BY locality"
     ).fetchall()
     return [r["locality"] for r in rows]
 
@@ -221,3 +237,33 @@ def get_unanalyzed(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "SELECT * FROM restaurants WHERE ai_analysis_json IS NULL OR ai_analysis_json=''"
     ).fetchall()
     return [row_to_dict(r) for r in rows]
+
+
+def get_distinct_cuisines(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT ai_analysis_json FROM restaurants WHERE ai_analysis_json IS NOT NULL AND ai_analysis_json != ''"
+    ).fetchall()
+    cuisine_set = set()
+    for row in rows:
+        try:
+            ai = json.loads(row["ai_analysis_json"])
+            for c in ai.get("cuisines", []):
+                cuisine_set.add(c.strip())
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return sorted(cuisine_set)
+
+
+def get_distinct_vibes(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT ai_analysis_json FROM restaurants WHERE ai_analysis_json IS NOT NULL AND ai_analysis_json != ''"
+    ).fetchall()
+    vibe_set = set()
+    for row in rows:
+        try:
+            ai = json.loads(row["ai_analysis_json"])
+            for v in ai.get("vibe_tags", []):
+                vibe_set.add(v.strip())
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return sorted(vibe_set)

@@ -15,6 +15,7 @@ HEADERS = {
 }
 
 
+
 def _sanitize(text: str, max_len: int = 500) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -60,13 +61,9 @@ def fetch_reddit_mentions(restaurant_name: str, limit: int = 10) -> list[dict[st
 def fetch_duckduckgo_mentions(restaurant_name: str, max_results: int = 5) -> list[dict[str, str]]:
     results: list[dict[str, str]] = []
     query = f"{restaurant_name} Hyderabad food review menu blog"
-    # FIX: import inside try, but keep search logic at the same level
     try:
         from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
 
-    try:
         with DDGS() as ddgs:
             for item in ddgs.text(query, max_results=max_results):
                 results.append(
@@ -79,7 +76,6 @@ def fetch_duckduckgo_mentions(restaurant_name: str, max_results: int = 5) -> lis
                 )
         time.sleep(0.5)
     except Exception:
-        # Fallback to HTML scraping if DDGS fails
         try:
             with httpx.Client(timeout=20.0, headers=HEADERS) as client:
                 resp = client.get(

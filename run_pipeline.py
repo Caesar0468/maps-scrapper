@@ -21,7 +21,10 @@ SAMPLE_FILE = DATA_DIR / "sample_restaurants.json"
 def seed_sample_data() -> list[dict[str, Any]]:
     """Provide demo restaurants when scraping is skipped."""
     if SAMPLE_FILE.exists():
-        return json.loads(SAMPLE_FILE.read_text(encoding="utf-8"))
+        try:
+            return json.loads(SAMPLE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass  # fall through to hard‑coded samples if file is corrupt
 
     return [
         {
@@ -101,6 +104,13 @@ def run_full_pipeline(
         if progress_callback:
             progress_callback(payload)
 
+    # Helper to wrap callbacks from lower‑level modules with a stage
+    def make_callback(stage: str):
+        def cb(data: dict[str, Any]):
+            if progress_callback:
+                progress_callback({"stage": stage, **data})
+        return cb
+
     conn = db.init_db()
     count = 0
 
@@ -109,30 +119,40 @@ def run_full_pipeline(
         places = seed_sample_data()
         report("scrape", message=f"Using {len(places)} sample restaurants")
     else:
-        places = run_scraper(max_targets=max_targets, skip_details=False, progress_callback=progress_callback)
+        places = run_scraper(
+            max_targets=max_targets,
+            skip_details=False,
+            progress_callback=make_callback("scrape"),
+        )
         report("scrape", message=f"Scraped {len(places)} places")
 
-    social_contexts: dict[str, dict] = {}
+    # Social contexts keyed by index to avoid duplicate‑name collisions
+    social_contexts: dict[int, dict] = {}
     if not skip_social:
         report("social", message="Scouring Reddit & DuckDuckGo")
-        for place in places:
+        for idx, place in enumerate(places):
             try:
                 result = scour_restaurant(place)
-                social_contexts[place["name"]] = result.get("social_context", {})
+                social_contexts[idx] = result.get("social_context", {})
             except Exception as exc:
                 print(f"  Social scour failed for {place.get('name')}: {exc}")
 
     if not skip_llm:
         ollama_ok = check_ollama_available(model)
         report("llm", message=f"Ollama available: {ollama_ok}, model: {model}")
-        places = batch_analyze(places, social_contexts, model=model, progress_callback=progress_callback)
+        places = batch_analyze(
+            places,
+            social_contexts,
+            model=model,
+            progress_callback=make_callback("llm"),
+        )
     else:
         report("llm", message="Skipping LLM analysis")
 
     report("database", message="Saving to SQLite")
-    for place in places:
-        if place.get("name") in social_contexts:
-            place["social_context"] = social_contexts[place["name"]]
+    for idx, place in enumerate(places):
+        if idx in social_contexts:
+            place["social_context"] = social_contexts[idx]
         db.upsert_restaurant(conn, place)
         count += 1
 

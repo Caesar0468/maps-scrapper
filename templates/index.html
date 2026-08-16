@@ -17,44 +17,63 @@
     </div>
 
     <!-- Filter Drawer -->
-    <div class="p-4 border-b border-slate-100 space-y-3 overflow-y-auto max-h-[50vh] filter-drawer">
+    <div class="space-y-3">
+      <!-- Search -->
       <div class="relative">
         <input type="search" id="search-input" placeholder="Search name, dish, cuisine…"
-               class="w-full pl-9 pr-3 py-2 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none">
+              class="w-full pl-9 pr-3 py-2 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none">
         <svg class="absolute left-3 top-2.5 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       </div>
 
+      <!-- Locality + Sort -->
       <div class="grid grid-cols-2 gap-2">
-        <select id="locality-filter" class="text-xs border border-slate-200 rounded-lg px-2 py-2">
-          <option value="">All Localities</option>
-          {% for loc in localities %}
-          <option value="{{ loc }}">{{ loc }}</option>
-          {% endfor %}
-        </select>
+        <div class="relative">
+          <input list="locality-list" id="locality-filter" placeholder="Locality" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
+          <datalist id="locality-list">
+            {% for loc in localities %}
+            <option value="{{ loc }}">
+            {% endfor %}
+          </datalist>
+        </div>
         <select id="sort-select" class="text-xs border border-slate-200 rounded-lg px-2 py-2">
           <option value="reviews">Most Reviews</option>
           <option value="rating">Highest Rating</option>
           <option value="hype">Hype Score</option>
           <option value="distance">Nearest</option>
           <option value="name">Name A-Z</option>
+          <option value="spend">Spend (Low→High)</option>
         </select>
       </div>
 
-      <!-- Cuisine pills -->
+      <!-- Cuisine (multi-select) -->
       <div>
         <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Cuisine</label>
-        <div id="cuisine-pills" class="flex flex-wrap gap-1.5 mt-1.5">
-          {% for c in ["Biryani","South Indian","Chinese","Mughlai","Continental","Chaat","Mandi","Cafe"] %}
-          <button class="cuisine-pill px-2.5 py-1 text-xs rounded-full border border-slate-200 hover:bg-blue-50" data-cuisine="{{ c }}">{{ c }}</button>
-          {% endfor %}
-        </div>
+        <select id="cuisine-filter" multiple size="3" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1">
+          <!-- filled by JS -->
+        </select>
+        <p class="text-[10px] text-slate-400 mt-0.5">Hold Ctrl/Cmd to select multiple</p>
       </div>
 
-      <!-- Toggle filters -->
-      <div class="space-y-2">
+      <!-- Dietary Suitability -->
+      <div>
+        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Dietary Suitability</label>
+        <select id="dietary-filter" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
+          <option value="">All</option>
+          <option value="Pure Veg">Pure Veg</option>
+          <option value="Non-Veg Specialty">Non‑Veg Specialty</option>
+          <option value="Balanced">Balanced</option>
+        </select>
+      </div>
+
+      <!-- Toggles -->
+      <div class="space-y-1">
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input type="checkbox" id="open-now-filter" class="rounded border-slate-300 text-blue-600">
           <span>Open Now</span>
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="late-night-filter" class="rounded border-slate-300 text-indigo-600">
+          <span>Open Late Night</span>
         </label>
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input type="checkbox" id="pure-veg-filter" class="rounded border-slate-300 text-green-600">
@@ -62,22 +81,34 @@
         </label>
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input type="checkbox" id="exclude-avoid-veg" class="rounded border-slate-300 text-orange-600">
-          <span>Exclude "Avoid Veg" flagged</span>
+          <span>Exclude "Avoid Veg"</span>
         </label>
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input type="checkbox" id="exclude-avoid-nonveg" class="rounded border-slate-300 text-orange-600">
-          <span>Exclude "Avoid Non-Veg" flagged</span>
+          <span>Exclude "Avoid Non‑Veg"</span>
         </label>
+        <!-- NEW: Low fake-review risk filter -->
         <label class="flex items-center gap-2 text-sm cursor-pointer">
-          <input type="checkbox" id="low-fake-risk" class="rounded border-slate-300 text-emerald-600">
+          <input type="checkbox" id="low-fake-risk" class="rounded border-slate-300 text-purple-600">
           <span>Low Fake-Review Risk Only</span>
         </label>
+      </div>
+
+      <!-- Fake‑review risk -->
+      <div>
+        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Fake‑Review Risk</label>
+        <select id="fake-risk-filter" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
+          <option value="">All</option>
+          <option value="Low">Low</option>
+          <option value="Moderate">Moderate</option>
+          <option value="High">High</option>
+        </select>
       </div>
 
       <!-- Hype verdict -->
       <div>
         <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Hype Verdict</label>
-        <select id="hype-filter" class="w-full mt-1 text-xs border border-slate-200 rounded-lg px-2 py-2">
+        <select id="hype-filter" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
           <option value="">All Verdicts</option>
           <option value="Hidden Gem">Hidden Gem</option>
           <option value="Justified Hype">Justified Hype</option>
@@ -86,31 +117,16 @@
         </select>
       </div>
 
-      <!-- Budget slider -->
+      <!-- Vibe (multi-select) -->
       <div>
-        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">
-          Spend for Two: ₹<span id="budget-min-label">100</span> – ₹<span id="budget-max-label">5000+</span>
-        </label>
-        <div class="flex gap-2 mt-1">
-          <input type="range" id="budget-min" min="100" max="5000" value="100" step="100" class="flex-1 accent-blue-600">
-          <input type="range" id="budget-max" min="100" max="5000" value="5000" step="100" class="flex-1 accent-blue-600">
-        </div>
-      </div>
-
-      <!-- Vibe tags -->
-      <div>
-        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Vibes</label>
-        <select id="vibe-filter" class="w-full mt-1 text-xs border border-slate-200 rounded-lg px-2 py-2">
-          <option value="">All Vibes</option>
-          <option value="Late Night">Late Night (Past 12 AM)</option>
-          <option value="Family Dining">Family Dining</option>
-          <option value="Student Spot">Hostel / Student Spot</option>
-          <option value="Work Cafe">Work Cafe</option>
-          <option value="Date Night">Date Night</option>
+        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Vibe</label>
+        <select id="vibe-filter" multiple size="2" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1">
+          <!-- filled by JS -->
         </select>
+        <p class="text-[10px] text-slate-400 mt-0.5">Hold Ctrl/Cmd to select multiple</p>
       </div>
 
-      <!-- GPS / Distance -->
+      <!-- GPS -->
       <div>
         <button id="gps-btn" class="w-full py-2 text-sm font-medium bg-emerald-600 text-white rounded-xl hover:bg-emerald-700 transition">
           📍 Use My Location
@@ -123,9 +139,12 @@
         </div>
       </div>
 
+      <!-- Actions -->
       <div class="flex gap-2">
         <button id="pipeline-btn" class="flex-1 py-2 text-xs font-medium bg-blue-600 text-white rounded-xl hover:bg-blue-700">Run Pipeline</button>
-        <button id="reset-filters" class="px-3 py-2 text-xs border border-slate-200 rounded-xl hover:bg-slate-50">Reset</button>
+        <button id="reset-filters" class="px-3 py-2 text-xs border border-slate-200 rounded-xl hover:bg-slate-50">
+          Reset <span id="active-filter-count" class="hidden ml-1 bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded-full text-[10px]">0</span>
+        </button>
       </div>
       <div id="pipeline-status" class="hidden text-xs p-2 bg-amber-50 border border-amber-200 rounded-lg"></div>
     </div>
