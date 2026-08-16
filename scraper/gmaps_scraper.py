@@ -293,8 +293,6 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
 def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, Any]]:
     name = str(target["name"])
     lat, lon = float(target["lat"]), float(target["lon"])
-    
-    # Coordinate-anchored search URL prevents Google Maps polygon redirects
     url = f"https://www.google.com/maps/search/restaurants/@{lat},{lon},15z"
     print(f"\n📍 Scanning {target['type']}: {name}")
 
@@ -310,7 +308,6 @@ def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, 
             page.wait_for_selector(feed_selector, timeout=5000)
             feed_found = True
         except Exception:
-            # Fallback: Actively submit search in searchbox if the feed didn't open
             search_box = page.locator('input#searchboxinput, input[name="q"]').first
             if search_box.is_visible(timeout=2000):
                 search_box.fill(f"Restaurants in {name} Hyderabad")
