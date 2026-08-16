@@ -15,6 +15,7 @@ HEADERS = {
 }
 
 
+
 def _sanitize(text: str, max_len: int = 500) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -61,6 +62,8 @@ def fetch_duckduckgo_mentions(restaurant_name: str, max_results: int = 5) -> lis
     results: list[dict[str, str]] = []
     query = f"{restaurant_name} Hyderabad food review menu blog"
     try:
+        from ddgs import DDGS
+    except ImportError:
         from duckduckgo_search import DDGS
 
         with DDGS() as ddgs:
