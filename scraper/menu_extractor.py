@@ -1,6 +1,8 @@
-"""Menu extraction from Google Maps DOM and QR code scanning from photos."""
+"""Menu extraction from Google Maps DOM and QR/photo OCR."""
 from __future__ import annotations
 
+import io
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -20,6 +22,13 @@ try:
     PYZBAR_AVAILABLE = True
 except ImportError:
     PYZBAR_AVAILABLE = False
+
+try:
+    from PIL import Image
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
 
 def _scan_qr_from_bytes(image_bytes: bytes) -> str | None:
     if not CV2_AVAILABLE or not PYZBAR_AVAILABLE:
@@ -50,8 +59,57 @@ def _download_image(url: str) -> bytes | None:
         pass
     return None
 
+def _ocr_image_bytes(image_bytes: bytes) -> str:
+    if not TESSERACT_AVAILABLE:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        text = pytesseract.image_to_string(img)
+        return text.strip()
+    except Exception:
+        return ""
+
+def _ocr_image_with_google_vision(image_bytes: bytes) -> str:
+    try:
+        from google.cloud import vision
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=image_bytes)
+        response = client.text_detection(image=image)
+        texts = response.text_annotations
+        if texts:
+            return texts[0].description.strip()
+        return ""
+    except Exception:
+        return ""
+
+def _ocr_image(image_bytes: bytes) -> str:
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        text = _ocr_image_with_google_vision(image_bytes)
+        if text:
+            return text
+    return _ocr_image_bytes(image_bytes)
+
+def _parse_menu_text(text: str) -> list[dict[str, Any]]:
+    items = []
+    lines = text.split('\n')
+    current_category = "General"
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) < 30 and not re.search(r'[₹$]\s*\d', line):
+            current_category = line
+            continue
+        price_match = re.search(r'[₹$]\s*[\d,]+(?:\.\d{2})?', line)
+        if price_match:
+            price = price_match.group(0).replace(" ", "")
+            name = line.replace(price, "").strip(" -:—\t")
+            items.append({"category": current_category, "name": name or line, "price": price, "description": ""})
+    return items
+
 def _parse_menu_dom(page: Page) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+    # existing DOM parsing code (abbreviated)
+    items = []
     selectors = [
         'div[aria-label*="Menu"] div[class*="fontBodyMedium"]',
         'div[data-section-id="menu"] div',
@@ -69,14 +127,7 @@ def _parse_menu_dom(page: Page) -> list[dict[str, Any]]:
                 price_match = re.search(r"[₹$]\s*[\d,]+(?:\.\d{2})?", text)
                 if price_match:
                     name = text.replace(price_match.group(0), "").strip(" -—:\n\t")
-                    items.append(
-                        {
-                            "category": current_category,
-                            "name": name or text,
-                            "price": price_match.group(0).replace(" ", ""),
-                            "description": "",
-                        }
-                    )
+                    items.append({"category": current_category, "name": name or text, "price": price_match.group(0).replace(" ", ""), "description": ""})
                 elif len(text) < 40 and not re.search(r"\d", text):
                     current_category = text
             if items:
@@ -118,10 +169,8 @@ def _scan_menu_photos(page: Page) -> dict[str, Any]:
     return result
 
 def extract_menu_for_place(page: Page) -> dict[str, Any] | None:
-    items: list[dict[str, Any]] = []
+    items = []
     source = ""
-    
-    # Strictly target tabs within the restaurant's tablist
     menu_tab_selectors = [
         'div[role="tablist"] button[role="tab"]:has-text("Menu")',
         'button[role="tab"][aria-label*="Menu"]',
@@ -146,7 +195,24 @@ def extract_menu_for_place(page: Page) -> dict[str, Any] | None:
         if qr_data.get("qr_menu_url"):
             source = "In-Store QR Code Scan"
         elif qr_data.get("menu_images"):
-            source = "Google Maps Menu Photo Gallery"
+            source = "Google Maps Menu Photo Gallery (OCR)"
+            ocr_texts = []
+            for img_url in qr_data["menu_images"][:5]:
+                img_bytes = _download_image(img_url)
+                if img_bytes:
+                    ocr_text = _ocr_image(img_bytes)
+                    if ocr_text:
+                        ocr_texts.append(ocr_text)
+                        items.extend(_parse_menu_text(ocr_text))
+            if items:
+                return {
+                    "items": items,
+                    "source": source,
+                    "qr_menu_url": qr_data.get("qr_menu_url"),
+                    "menu_images": qr_data["menu_images"],
+                    "ocr_text": "\n".join(ocr_texts),
+                    "extracted_at": datetime.now(timezone.utc).isoformat(),
+                }
 
     if not items and not qr_data.get("qr_menu_url") and not qr_data.get("menu_images"):
         return None

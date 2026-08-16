@@ -29,7 +29,7 @@
       <section class="filter-card reveal-block">
         <div class="section-title"><span>Shape the hunt</span><button id="reset-filters" class="reset-btn">Reset <b id="active-filter-count" class="hidden">0</b></button></div>
         <div class="field-grid">
-          <label class="field"><span>Area</span><input list="locality-list" id="locality-filter" placeholder="Any neighbourhood"><datalist id="locality-list">{% for loc in localities %}<option value="{{ loc }}">{% endfor %}</datalist></label>
+          <label class="field"><span>Area</span><input list="locality-list" id="locality-filter" placeholder="Any neighbourhood"><datalist id="locality-list">{% for loc in localities %}<option value="{{ loc | e }}">{% endfor %}</datalist></label>
           <label class="field"><span>Sort</span><select id="sort-select"><option value="reviews">Most Reviews</option><option value="rating">Highest Rating</option><option value="hype">Hype Score</option><option value="distance">Nearest</option><option value="name">Name A–Z</option><option value="spend">Spend · Low → High</option></select></label>
         </div>
         <label class="field"><span>Cuisine</span><select id="cuisine-filter" multiple size="4"></select><small>⌘/Ctrl-click for a stack</small></label>

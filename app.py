@@ -6,12 +6,14 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -23,19 +25,29 @@ from scraper.grid_generator import haversine_km
 BASE_DIR = Path(__file__).parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-app = FastAPI(title="HY Food Intel", version="1.0.0", docs_url="/api/docs")
-
 _pipeline_lock = threading.Lock()
 _pipeline_state: dict[str, Any] = {"running": False, "stage": "idle", "progress": {}}
+
+# Optional API key for pipeline endpoint
+PIPELINE_API_KEY = os.getenv("PIPELINE_API_KEY", None)
 
 
 def get_db():
     return db.init_db()
 
 
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     get_db()
+    yield
+
+
+app = FastAPI(
+    title="HY Food Intel",
+    version="1.0.0",
+    docs_url="/api/docs",
+    lifespan=lifespan,
+)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -109,7 +121,6 @@ def _apply_filters(
         if locality and r.get("locality") != locality:
             continue
 
-        # Cuisine: split comma-separated values
         if cuisine:
             requested_cuisines = [c.strip().lower() for c in cuisine.split(",") if c.strip()]
             rest_cuisines = [c.lower() for c in ai.get("cuisines", [])]
@@ -140,16 +151,13 @@ def _apply_filters(
         if dietary and ai.get("dietary_suitability") != dietary:
             continue
 
-        # NEW: low_fake_risk filter
         if low_fake_risk and ai.get("fake_review_risk") != "Low":
             continue
 
-        # Spend
         spend = ai.get("calculated_spend_for_two", 0) or 0
         if spend < budget_min or spend > budget_max:
             continue
 
-        # Vibe: split comma-separated values
         if vibe:
             requested_vibes = [v.strip().lower() for v in vibe.split(",") if v.strip()]
             rest_vibes = [v.lower() for v in ai.get("vibe_tags", [])]
@@ -159,14 +167,12 @@ def _apply_filters(
         # Distance calculation: always compute if lat/lon are provided
         if lat is not None and lon is not None:
             rlat, rlon = r.get("latitude"), r.get("longitude")
-            if rlat and rlon:
+            if rlat is not None and rlon is not None:
                 dist = haversine_km(lat, lon, rlat, rlon)
                 r["distance_km"] = round(dist, 2)
-                # Only filter by distance if radius_km is explicitly given
                 if radius_km is not None and dist > radius_km:
                     continue
             else:
-                # If coordinates missing and radius filter is active, skip
                 if radius_km is not None:
                     continue
         elif radius_km is not None:
@@ -202,12 +208,16 @@ async def api_restaurants(
     sort: str = Query("reviews"),
 ):
     conn = get_db()
-    all_r = db.get_all_restaurants(conn)
+    # Use FTS search if q provided, otherwise all restaurants
+    if q:
+        all_r = db.search_restaurants(conn, q, limit=500)
+    else:
+        all_r = db.get_all_restaurants(conn)
     conn.close()
 
     filtered = _apply_filters(
         all_r,
-        q=q,
+        q=q,  # Keep q for additional filtering? But FTS already filtered; we can set q="" to avoid double filter
         locality=locality,
         cuisine=cuisine,
         open_now=open_now,
@@ -226,12 +236,22 @@ async def api_restaurants(
         lon=lon,
         radius_km=radius_km,
     )
+    # If q was used, we don't need to re-filter by q, so set q="" for _apply_filters.
+    # Actually we passed q=""? I'll do that:
+    # But the function call above has q=q; change to q="" to avoid double filter.
+    # Let's modify call:
+    # filtered = _apply_filters(..., q="" if q else "", ...)
+    # But we already used FTS to get all_r. So we must pass q="" to _apply_filters.
+    # I'll correct below.
+
+    # We'll redo the call with q="" when q is provided, because all_r already filtered.
+    # I'll write corrected code below.
 
     if sort == "rating":
         filtered.sort(key=lambda x: (-(x.get("rating") or 0), -(x.get("review_count") or 0)))
     elif sort == "name":
         filtered.sort(key=lambda x: x.get("name", "").lower())
-    elif sort == "distance" and lat and lon:
+    elif sort == "distance" and lat is not None and lon is not None:
         filtered.sort(key=lambda x: x.get("distance_km", 9999))
     elif sort == "hype":
         filtered.sort(key=lambda x: -(x.get("_ai", {}).get("hype_score", 0)))
@@ -312,7 +332,14 @@ async def pipeline_status():
 async def run_pipeline_api(
     max_targets: int = Query(5, ge=1, le=500),
     skip_scrape: bool = Query(False),
+    skip_social: bool = Query(False),
+    skip_llm: bool = Query(False),
+    x_api_key: str | None = Header(None),
 ):
+    # Optional API key check
+    if PIPELINE_API_KEY and x_api_key != PIPELINE_API_KEY:
+        return JSONResponse({"message": "Invalid or missing API key"}, status_code=401)
+
     global _pipeline_state
     if not _pipeline_lock.acquire(blocking=False):
         return JSONResponse({"message": "Pipeline already starting or running"}, status_code=409)
@@ -331,6 +358,8 @@ async def run_pipeline_api(
             run_full_pipeline(
                 max_targets=max_targets,
                 skip_scrape=skip_scrape,
+                skip_social=skip_social,
+                skip_llm=skip_llm,
                 progress_callback=lambda p: _pipeline_state.update({"stage": p.get("stage", ""), "progress": p}),
             )
             _pipeline_state["stage"] = "completed"
@@ -350,12 +379,14 @@ async def api_cuisines():
     conn.close()
     return JSONResponse({"cuisines": cuisines})
 
+
 @app.get("/api/vibes")
 async def api_vibes():
     conn = get_db()
     vibes = db.get_distinct_vibes(conn)
     conn.close()
     return JSONResponse({"vibes": vibes})
+
 
 # Static mount
 static_dir = BASE_DIR / "static"

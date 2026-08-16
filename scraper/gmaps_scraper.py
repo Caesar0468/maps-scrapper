@@ -14,6 +14,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_pl
 from config.targets import MIN_RATING, MIN_REVIEWS
 from scraper.grid_generator import generate_search_targets
 from scraper.menu_extractor import extract_menu_for_place
+from urllib.parse import urlparse, parse_qs
 
 RATING_RE = re.compile(r"(\d\.\d)")
 REVIEW_COUNT_RE = re.compile(r"\(?\b([\d,]+(?:\.\d+)?)\s*([KkMm])?\s*(?:reviews?|\)?)\b", re.IGNORECASE)
@@ -48,18 +49,31 @@ def parse_rating(text: str) -> float | None:
     return float(match.group(1)) if match else None
 
 def parse_review_count(text: str) -> int | None:
-    """Parse review count from text like '1,234 reviews' or '(1,234)'."""
+    """Parse review count from text like '1,234 reviews' or '(1,234)' or '1.2K reviews'."""
     if not text:
         return None
     cleaned = text.replace("\u00a0", " ").replace("\u202f", " ")
+
     # Try "1,234 reviews"
     match = re.search(r"\b([\d,]+)\s*reviews?\b", cleaned, re.IGNORECASE)
     if match:
         return int(match.group(1).replace(",", ""))
+
+    # Try "1.2K reviews" or "1.5M reviews"
+    match = re.search(r"\b(\d+\.?\d*)\s*([KkMm])\s*reviews?\b", cleaned)
+    if match:
+        number = float(match.group(1))
+        suffix = match.group(2).lower()
+        if suffix == 'k':
+            return int(number * 1000)
+        elif suffix == 'm':
+            return int(number * 1_000_000)
+
     # Try "(1,234)" after a rating
     match = re.search(r"\b\d\.\d\s*\(([\d,]+)\)", cleaned)
     if match:
         return int(match.group(1).replace(",", ""))
+
     # Any parenthesized number with comma
     match = re.search(r"\(([\d,]+)\)", cleaned)
     if match:
@@ -99,9 +113,11 @@ def extract_place_id(url: str) -> str | None:
     match = PLACE_ID_RE.search(unquote(url))
     return match.group(1) if match else None
 
-def dedupe_key(name: str, place_id: str | None, lat: float, lng: float) -> str:
+def dedupe_key(name: str, place_id: str | None, url: str, lat: float, lng: float) -> str:
     if place_id:
         return f"id:{place_id}"
+    if url:
+        return f"url:{url}"
     return f"coord:{name.strip().lower()}:{round(lat,4)}:{round(lng,4)}"
 
 def try_sort_by_rating(page: Page) -> None:
@@ -272,7 +288,7 @@ def parse_list_cards(page: Page, locality: str, fallback: tuple[float, float]) -
     unique = []
     seen_keys = set()
     for r in results:
-        key = dedupe_key(r["name"], r.get("place_id"), r["latitude"], r["longitude"])
+        key = dedupe_key(r["name"], r.get("place_id"), r.get("google_maps_url"), r["latitude"], r["longitude"])
         if key not in seen_keys:
             seen_keys.add(key)
             unique.append(r)
@@ -336,6 +352,11 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
             el = page.locator(selector).first
             if el.count() > 0:
                 href = el.get_attribute("href") or ""
+                if href and "google.com/url" in href:
+                    parsed = parse_qs(urlparse(href).query)
+                    actual = parsed.get("q", [""])[0]
+                    if actual:
+                        href = actual
                 if href and "google.com" not in href:
                     result["website"] = href.strip()
                     metadata_sources["website"] = {"value": href.strip(), "source": "Google Maps Place Button"}
@@ -480,7 +501,13 @@ def run_scraper(
 
             places = scrape_target(page, target)
             for place in places:
-                key = dedupe_key(place["name"], place.get("place_id"), place["latitude"], place["longitude"])
+                key = dedupe_key(
+                    place["name"],
+                    place.get("place_id"),
+                    place.get("google_maps_url"),
+                    place["latitude"],
+                    place["longitude"]
+                )
                 if key not in seen:
                     seen.add(key)
                     all_places.append(place)

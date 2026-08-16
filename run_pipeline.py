@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """CLI pipeline orchestrator: Scrape → Menu → Scour → LLM → Database."""
-
 from __future__ import annotations
 
 import argparse
@@ -8,6 +7,9 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Callable
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import database as db
 from pipeline.analyzer import batch_analyze, check_ollama_available
@@ -111,60 +113,59 @@ def run_full_pipeline(
         return cb
 
     conn = db.init_db()
-    count = 0
+    try:
+        report("scrape", message="Starting scrape phase")
+        if skip_scrape:
+            places = seed_sample_data()
+            report("scrape", message=f"Using {len(places)} sample restaurants")
+        else:
+            places = run_scraper(
+                max_targets=max_targets,
+                skip_details=False,
+                progress_callback=make_callback("scrape"),
+            )
+            report("scrape", message=f"Scraped {len(places)} places")
 
-    report("scrape", message="Starting scrape phase")
-    if skip_scrape:
-        places = seed_sample_data()
-        report("scrape", message=f"Using {len(places)} sample restaurants")
-    else:
-        places = run_scraper(
-            max_targets=max_targets,
-            skip_details=False,
-            progress_callback=make_callback("scrape"),
-        )
-        report("scrape", message=f"Scraped {len(places)} places")
+        social_contexts: dict[int, dict] = {}
+        if not skip_social:
+            report("social", message="Scouring Reddit & DuckDuckGo")
+            for idx, place in enumerate(places):
+                try:
+                    if progress_callback:
+                        progress_callback({
+                            "stage": "social",
+                            "current": idx + 1,
+                            "total": len(places),
+                            "name": place.get("name", ""),
+                            "message": f"Scouring social for {place.get('name', '')} ({idx+1}/{len(places)})"
+                        })
+                    result = scour_restaurant(place)
+                    social_contexts[idx] = result.get("social_context", {})
+                except Exception as exc:
+                    print(f"  Social scour failed for {place.get('name')}: {exc}")
 
-    social_contexts: dict[int, dict] = {}
-    if not skip_social:
-        report("social", message="Scouring Reddit & DuckDuckGo")
+        if not skip_llm:
+            ollama_ok = check_ollama_available(model)
+            report("llm", message=f"Ollama available: {ollama_ok}, model: {model}")
+            places = batch_analyze(
+                places,
+                social_contexts,
+                model=model,
+                progress_callback=make_callback("llm"),
+            )
+        else:
+            report("llm", message="Skipping LLM analysis")
+
+        report("database", message="Saving to SQLite")
         for idx, place in enumerate(places):
-            try:
-                if progress_callback:
-                    progress_callback({
-                        "stage": "social",
-                        "current": idx + 1,
-                        "total": len(places),
-                        "name": place.get("name", ""),
-                        "message": f"Scouring social for {place.get('name', '')} ({idx+1}/{len(places)})"
-                    })
-                result = scour_restaurant(place)
-                social_contexts[idx] = result.get("social_context", {})
-            except Exception as exc:
-                print(f"  Social scour failed for {place.get('name')}: {exc}")
+            if idx in social_contexts:
+                place["social_context"] = social_contexts[idx]
+            db.upsert_restaurant(conn, place)
 
-    if not skip_llm:
-        ollama_ok = check_ollama_available(model)
-        report("llm", message=f"Ollama available: {ollama_ok}, model: {model}")
-        places = batch_analyze(
-            places,
-            social_contexts,
-            model=model,
-            progress_callback=make_callback("llm"),
-        )
-    else:
-        report("llm", message="Skipping LLM analysis")
-
-    report("database", message="Saving to SQLite")
-    for idx, place in enumerate(places):
-        if idx in social_contexts:
-            place["social_context"] = social_contexts[idx]
-        db.upsert_restaurant(conn, place)
-        count += 1
-
-    conn.close()
-    report("done", message=f"Pipeline complete — {count} restaurants saved")
-    return count
+        report("done", message=f"Pipeline complete — {len(places)} restaurants saved")
+        return len(places)
+    finally:
+        conn.close()
 
 
 def main():
@@ -173,7 +174,7 @@ def main():
     parser.add_argument("--skip-scrape", action="store_true", help="Use sample data instead of scraping")
     parser.add_argument("--skip-social", action="store_true", help="Skip Reddit/DDG scour")
     parser.add_argument("--skip-llm", action="store_true", help="Skip Ollama analysis")
-    parser.add_argument("--model", default="qwen3:8b", help="Ollama model name")
+    parser.add_argument("--model", default=None, help="Model name for LLM (defaults to provider default)")
     args = parser.parse_args()
 
     count = run_full_pipeline(

@@ -28,6 +28,7 @@ Thumbs.db
 # Playwright & browser downloads
 .playwright/
 
+.env
 
 ==================================================
 FILE: ./README.md
@@ -457,14 +458,14 @@ from __future__ import annotations
 import csv
 import io
 import json
-import math
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -484,11 +485,17 @@ _pipeline_state: dict[str, Any] = {"running": False, "stage": "idle", "progress"
 def get_db():
     return db.init_db()
 
-
-@app.on_event("startup")
-def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     get_db()
+    yield
 
+app = FastAPI(
+    title="HY Food Intel",
+    version="1.0.0",
+    docs_url="/api/docs",
+    lifespan=lifespan,
+)
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -592,6 +599,10 @@ def _apply_filters(
         if dietary and ai.get("dietary_suitability") != dietary:
             continue
 
+        # NEW: low_fake_risk filter
+        if low_fake_risk and ai.get("fake_review_risk") != "Low":
+            continue
+
         # Spend
         spend = ai.get("calculated_spend_for_two", 0) or 0
         if spend < budget_min or spend > budget_max:
@@ -604,15 +615,22 @@ def _apply_filters(
             if requested_vibes and not any(req in rest_vibes for req in requested_vibes):
                 continue
 
-        if lat is not None and lon is not None and radius_km is not None:
+        # Distance calculation: always compute if lat/lon are provided
+        if lat is not None and lon is not None:
             rlat, rlon = r.get("latitude"), r.get("longitude")
             if rlat and rlon:
                 dist = haversine_km(lat, lon, rlat, rlon)
                 r["distance_km"] = round(dist, 2)
-                if dist > radius_km:
+                # Only filter by distance if radius_km is explicitly given
+                if radius_km is not None and dist > radius_km:
                     continue
             else:
-                continue
+                # If coordinates missing and radius filter is active, skip
+                if radius_km is not None:
+                    continue
+        elif radius_km is not None:
+            # radius without lat/lon is meaningless
+            pass
 
         r["_ai"] = ai
         results.append(r)
@@ -890,7 +908,7 @@ def init_db(db_path: Path | None = None) -> sqlite3.Connection:
             locality,
             cuisines,
             must_try_items,
-            tokenize='porter unicode61'
+            tokenize='porter'
         );
         """
     )
@@ -936,14 +954,21 @@ def upsert_restaurant(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
     menu_images = data.get("menu_images") or data.get("menu_images_json") or []
     menu_images_json = menu_images if isinstance(menu_images, str) else json.dumps(menu_images)
 
-    existing = conn.execute("SELECT id FROM restaurants WHERE slug=? OR place_id=?",
-                            (slug, data.get("place_id"))).fetchone()
+    # ✅ Correct review_count handling
+    review_count = data.get("review_count")
+    if review_count is None:
+        review_count = data.get("reviews")
+
+    existing = conn.execute(
+        "SELECT id FROM restaurants WHERE slug=? OR place_id=?",
+        (slug, data.get("place_id"))
+    ).fetchone()
 
     fields = {
         "slug": slug,
         "name": data["name"],
         "rating": data.get("rating"),
-        "review_count": data.get("review_count") or data.get("reviews"),
+        "review_count": review_count,          # ← use the variable
         "locality": data.get("locality"),
         "address": data.get("address"),
         "latitude": data.get("latitude"),
@@ -987,22 +1012,22 @@ def upsert_restaurant(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
     conn.commit()
     return row_id
 
-
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
-    for key in (
+    json_keys = (
         "opening_hours_json",
         "raw_menu_json",
         "menu_images_json",
         "metadata_sources_json",
         "social_context_json",
         "ai_analysis_json",
-    ):
-        if d.get(key):
+    )
+    for key in json_keys:
+        if key in d:
+            raw = d.pop(key)
+            clean_key = key.replace("_json", "")
             try:
-                clean_key = key.replace("_json", "")
-                d[clean_key] = json.loads(d[key])
-                del d[key]  # remove raw JSON key
+                d[clean_key] = json.loads(raw) if raw else None
             except json.JSONDecodeError:
                 d[clean_key] = None
     if d.get("is_open_now") is not None:
@@ -1021,21 +1046,29 @@ def get_restaurant_by_slug(conn: sqlite3.Connection, slug: str) -> dict[str, Any
 
 
 def search_restaurants(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT r.* FROM restaurants r
-        JOIN restaurants_fts fts ON r.id = fts.rowid
-        WHERE fts MATCH ?
-        ORDER BY rank LIMIT ?
-        """,
-        (query, limit),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT r.* FROM restaurants r
+            JOIN restaurants_fts fts ON r.id = fts.rowid
+            WHERE fts MATCH ?
+            ORDER BY rank LIMIT ?
+            """,
+            (query, limit),
+        ).fetchall()
+    except sqlite3.Error:
+        # Fallback to simple LIKE search if FTS query fails
+        like_query = f"%{query}%"
+        rows = conn.execute(
+            "SELECT * FROM restaurants WHERE name LIKE ? OR locality LIKE ? ORDER BY review_count DESC LIMIT ?",
+            (like_query, like_query, limit),
+        ).fetchall()
     return [row_to_dict(r) for r in rows]
 
 
 def get_localities(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
-        "SELECT DISTINCT locality FROM restaurants WHERE locality IS NOT NULL ORDER BY locality"
+        "SELECT DISTINCT locality FROM restaurants WHERE locality IS NOT NULL AND locality != '' ORDER BY locality"
     ).fetchall()
     return [r["locality"] for r in rows]
 
@@ -1045,6 +1078,7 @@ def get_unanalyzed(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "SELECT * FROM restaurants WHERE ai_analysis_json IS NULL OR ai_analysis_json=''"
     ).fetchall()
     return [row_to_dict(r) for r in rows]
+
 
 def get_distinct_cuisines(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
@@ -1056,9 +1090,10 @@ def get_distinct_cuisines(conn: sqlite3.Connection) -> list[str]:
             ai = json.loads(row["ai_analysis_json"])
             for c in ai.get("cuisines", []):
                 cuisine_set.add(c.strip())
-        except:
+        except (json.JSONDecodeError, TypeError):
             pass
     return sorted(cuisine_set)
+
 
 def get_distinct_vibes(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
@@ -1070,9 +1105,59 @@ def get_distinct_vibes(conn: sqlite3.Connection) -> list[str]:
             ai = json.loads(row["ai_analysis_json"])
             for v in ai.get("vibe_tags", []):
                 vibe_set.add(v.strip())
-        except:
+        except (json.JSONDecodeError, TypeError):
             pass
     return sorted(vibe_set)
+
+==================================================
+FILE: ./debug_gmaps.py
+==================================================
+
+from playwright.sync_api import sync_playwright
+import time
+
+URL = "https://www.google.com/maps/search/Restaurants%20in%20Abids%20Hyderabad"
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto(URL, wait_until="domcontentloaded", timeout=35000)
+    time.sleep(3)
+    # dismiss overlays
+    for text in ("Accept all", "Reject all", "Not now", "Maybe later"):
+        try:
+            btn = page.locator(f'button:has-text("{text}")').first
+            if btn.is_visible(timeout=500):
+                btn.click(timeout=1000)
+                time.sleep(1)
+                break
+        except Exception:
+            pass
+
+    # Wait for at least one article
+    try:
+        page.wait_for_selector('div[role="article"]', timeout=15000)
+        print("Articles found")
+    except Exception as e:
+        print("No articles:", e)
+
+    articles = page.locator('div[role="article"]')
+    print("Article count:", articles.count())
+    for i in range(min(3, articles.count())):
+        try:
+            art = articles.nth(i)
+            print(f"\n--- Article {i} ---")
+            print("Tag:", art.evaluate("el => el.tagName"))
+            print("Inner text:", art.inner_text(timeout=1000)[:500])
+            # Find links inside
+            links = art.locator('a[href*="/maps/place/"]')
+            print("Links count:", links.count())
+            if links.count() > 0:
+                print("First link href:", links.first.get_attribute("href"))
+        except Exception as e:
+            print("Error:", e)
+
+    browser.close()
 
 ==================================================
 FILE: ./requirements.txt
@@ -1087,7 +1172,7 @@ python-multipart>=0.0.9
 # Browser Automation & Scraping
 playwright>=1.42.0
 httpx>=0.27.0
-duckduckgo-search>=0.1.0
+duckduckgo-search>=6.0.0   # updated package name (underscore internally)
 
 # Computer Vision & QR Extraction
 opencv-python-headless>=4.9.0.80
@@ -1097,15 +1182,23 @@ numpy>=1.26.0
 # Data Validation & Utilities
 pydantic>=2.7.0
 
+# Optional OCR / Vision (uncomment if needed)
+# pytesseract>=0.3.10
+# Pillow>=9.0.0
+# google-cloud-vision>=3.4.0
+
+python-dotenv>=1.0.0
 
 ==================================================
 FILE: ./run_pipeline.py
 ==================================================
 
 #!/usr/bin/env python3
-"""CLI pipeline orchestrator: Scrape → Menu → Scour → LLM → Database."""
-
 from __future__ import annotations
+"""CLI pipeline orchestrator: Scrape → Menu → Scour → LLM → Database."""
+from dotenv import load_dotenv
+load_dotenv()
+
 
 import argparse
 import json
@@ -1125,7 +1218,10 @@ SAMPLE_FILE = DATA_DIR / "sample_restaurants.json"
 def seed_sample_data() -> list[dict[str, Any]]:
     """Provide demo restaurants when scraping is skipped."""
     if SAMPLE_FILE.exists():
-        return json.loads(SAMPLE_FILE.read_text(encoding="utf-8"))
+        try:
+            return json.loads(SAMPLE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
 
     return [
         {
@@ -1205,38 +1301,65 @@ def run_full_pipeline(
         if progress_callback:
             progress_callback(payload)
 
+    def make_callback(stage: str):
+        def cb(data: dict[str, Any]):
+            if progress_callback:
+                progress_callback({"stage": stage, **data})
+        return cb
+
     conn = db.init_db()
-    count = 0
+    try:
+        count = 0
+        # ... rest of the pipeline code (scrape, social, LLM, upsert)
+    finally:
+        conn.close()
 
     report("scrape", message="Starting scrape phase")
     if skip_scrape:
         places = seed_sample_data()
         report("scrape", message=f"Using {len(places)} sample restaurants")
     else:
-        places = run_scraper(max_targets=max_targets, skip_details=False, progress_callback=progress_callback)
+        places = run_scraper(
+            max_targets=max_targets,
+            skip_details=False,
+            progress_callback=make_callback("scrape"),
+        )
         report("scrape", message=f"Scraped {len(places)} places")
 
-    social_contexts: dict[str, dict] = {}
+    social_contexts: dict[int, dict] = {}
     if not skip_social:
         report("social", message="Scouring Reddit & DuckDuckGo")
-        for place in places:
+        for idx, place in enumerate(places):
             try:
+                if progress_callback:
+                    progress_callback({
+                        "stage": "social",
+                        "current": idx + 1,
+                        "total": len(places),
+                        "name": place.get("name", ""),
+                        "message": f"Scouring social for {place.get('name', '')} ({idx+1}/{len(places)})"
+                    })
                 result = scour_restaurant(place)
-                social_contexts[place["name"]] = result.get("social_context", {})
+                social_contexts[idx] = result.get("social_context", {})
             except Exception as exc:
                 print(f"  Social scour failed for {place.get('name')}: {exc}")
 
     if not skip_llm:
         ollama_ok = check_ollama_available(model)
         report("llm", message=f"Ollama available: {ollama_ok}, model: {model}")
-        places = batch_analyze(places, social_contexts, model=model, progress_callback=progress_callback)
+        places = batch_analyze(
+            places,
+            social_contexts,
+            model=model,
+            progress_callback=make_callback("llm"),
+        )
     else:
         report("llm", message="Skipping LLM analysis")
 
     report("database", message="Saving to SQLite")
-    for place in places:
-        if place.get("name") in social_contexts:
-            place["social_context"] = social_contexts[place["name"]]
+    for idx, place in enumerate(places):
+        if idx in social_contexts:
+            place["social_context"] = social_contexts[idx]
         db.upsert_restaurant(conn, place)
         count += 1
 
@@ -1268,7 +1391,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-
 ==================================================
 FILE: ./scraper/__init__.py
 ==================================================
@@ -1296,6 +1418,7 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_pl
 from config.targets import MIN_RATING, MIN_REVIEWS
 from scraper.grid_generator import generate_search_targets
 from scraper.menu_extractor import extract_menu_for_place
+from urllib.parse import urlparse, parse_qs
 
 RATING_RE = re.compile(r"(\d\.\d)")
 REVIEW_COUNT_RE = re.compile(r"\(?\b([\d,]+(?:\.\d+)?)\s*([KkMm])?\s*(?:reviews?|\)?)\b", re.IGNORECASE)
@@ -1307,53 +1430,61 @@ PHONE_RE = re.compile(r"(?:\+91[\s-]?)?(?:\(?0?\d{2,4}\)?[\s-]?)?\d{4}[\s-]?\d{4
 def random_delay(min_s: float = 0.4, max_s: float = 0.8) -> None:
     time.sleep(random.uniform(min_s, max_s))
 
-def dismiss_overlays(page: Page) -> None:
-    try:
-        close_drawer = page.locator('button[aria-label="Close"], button[jsaction*="drawer.close"]').first
-        if close_drawer.is_visible(timeout=500):
-            close_drawer.click()
-    except Exception:
-        pass
-    for text in ("Accept all", "Reject all", "I agree", "Agree"):
+def dismiss_cookie_banners(page: Page) -> None:
+    """Dismiss cookie consent and sign-in prompts, but NOT generic close buttons."""
+    for text in ("Accept all", "Reject all", "I agree", "Agree", "Not now", "Maybe later"):
         try:
             btn = page.locator(f'button:has-text("{text}")').first
             if btn.is_visible(timeout=500):
-                btn.click()
+                btn.click(timeout=1000)
                 random_delay(0.2, 0.4)
                 break
         except Exception:
             pass
 
-def parse_review_count(text: str) -> int | None:
-    if not text:
-        return None
-    cleaned = text.replace("\u00a0", " ").replace("\u202f", " ").replace("(", "").replace(")", "").strip()
-    match = REVIEW_COUNT_RE.search(cleaned)
-    if not match:
-        digits = re.search(r"\b([\d,]+)\b", cleaned)
-        if digits:
-            try:
-                return int(digits.group(1).replace(",", ""))
-            except ValueError:
-                return None
-        return None
-    raw = match.group(1).replace(",", "")
-    suffix = (match.group(2) or "").upper()
-    try:
-        val = float(raw)
-        if suffix == "K":
-            val *= 1000
-        elif suffix == "M":
-            val *= 1_000_000
-        return int(val)
-    except ValueError:
-        return None
+def dismiss_overlays(page: Page) -> None:
+    """Dismiss common Google Maps popups."""
+    dismiss_cookie_banners(page)
 
 def parse_rating(text: str) -> float | None:
     if not text:
         return None
     match = RATING_RE.search(text)
     return float(match.group(1)) if match else None
+
+def parse_review_count(text: str) -> int | None:
+    """Parse review count from text like '1,234 reviews' or '(1,234)'."""
+    if not text:
+        return None
+    cleaned = text.replace("\u00a0", " ").replace("\u202f", " ")
+    # Try "1,234 reviews"
+    match = re.search(r"\b([\d,]+)\s*reviews?\b", cleaned, re.IGNORECASE)
+    if match:
+        return int(match.group(1).replace(",", ""))
+    # Try "(1,234)" after a rating
+    match = re.search(r"\b\d\.\d\s*\(([\d,]+)\)", cleaned)
+    if match:
+        return int(match.group(1).replace(",", ""))
+    # Any parenthesized number with comma
+    match = re.search(r"\(([\d,]+)\)", cleaned)
+    if match:
+        return int(match.group(1).replace(",", ""))
+    return None
+
+def extract_rating_reviews(text: str) -> tuple[float | None, int | None]:
+    """Extract rating and review count from a block of text.
+    Handles both '4.5(12,237)' and '4.5 (12,237 reviews)' formats.
+    """
+    if not text:
+        return None, None
+    match = re.search(r"(\d\.\d)\s*\(([\d,]+)\)", text)
+    if match:
+        rating = float(match.group(1))
+        reviews = int(match.group(2).replace(",", ""))
+        return rating, reviews
+    rating = parse_rating(text)
+    reviews = parse_review_count(text)
+    return rating, reviews
 
 def extract_coordinates(url: str, fallback: tuple[float, float]) -> tuple[float, float]:
     if not url:
@@ -1373,94 +1504,124 @@ def extract_place_id(url: str) -> str | None:
     match = PLACE_ID_RE.search(unquote(url))
     return match.group(1) if match else None
 
-def dedupe_key(name: str, place_id: str | None, lat: float, lng: float) -> str:
+def dedupe_key(name: str, place_id: str | None, url: str, lat: float, lng: float) -> str:
     if place_id:
         return f"id:{place_id}"
+    if url:
+        return f"url:{url}"
     return f"coord:{name.strip().lower()}:{round(lat,4)}:{round(lng,4)}"
 
-def scroll_feed(page: Page, max_scrolls: int = 25) -> None:
-    feed = page.locator('div[role="feed"], div[aria-label*="Results"], .m6QErb[aria-label]').first
-    if feed.count() == 0:
-        return
+def try_sort_by_rating(page: Page) -> None:
+    """Attempt to sort results by Top rated (highest first)."""
+    try:
+        sort_btn = page.locator('button[aria-label*="Sort"]').first
+        if sort_btn.is_visible(timeout=3000):
+            sort_btn.click()
+            random_delay(0.5, 0.8)
+            top_rated = page.locator('div[role="menuitemradio"]:has-text("Top rated")').first
+            if top_rated.is_visible(timeout=2000):
+                top_rated.click()
+                random_delay(1.0, 1.5)
+                print("    Sorted by Top rated.")
+    except Exception:
+        pass
 
-    last_card_count = 0
-    stagnant_count = 0
+def scroll_feed(page: Page, max_scrolls: int = 50, max_time: float = 30.0) -> None:
+    """Scroll until end-of-list or limits reached."""
+    start_time = time.time()
+    last_count = 0
+    stagnant = 0
 
-    for _ in range(max_scrolls):
+    for i in range(max_scrolls):
+        if time.time() - start_time > max_time:
+            print(f"    ⏱️ Reached max scroll time ({max_time}s). Stopping.")
+            break
+
+        # Scroll
         try:
-            end_msg = page.locator('text="You\'ve reached the end of the list"').first
-            if end_msg.is_visible(timeout=300):
+            feed = page.locator('div[role="feed"]').first
+            if feed.count() > 0:
+                feed.evaluate("el => el.scrollTop = el.scrollHeight")
+            else:
+                page.mouse.wheel(0, 2000)
+        except Exception:
+            page.mouse.wheel(0, 2000)
+
+        random_delay(0.5, 0.8)
+
+        # End-of-list check
+        try:
+            if page.locator('text="You\'ve reached the end of the list"').is_visible(timeout=500):
+                print("    End of list reached.")
                 break
         except Exception:
             pass
 
-        cards = page.locator('div.Nv2PK')
-        current_count = cards.count()
+        # Count articles
+        try:
+            current = page.locator('div[role="article"]').count()
+        except Exception:
+            current = last_count
 
-        if current_count == last_card_count:
-            stagnant_count += 1
-            if stagnant_count >= 3:
+        if current == last_count:
+            stagnant += 1
+            if stagnant >= 5:
+                print(f"    No new results after {stagnant} scrolls. Stopping.")
                 break
         else:
-            stagnant_count = 0
-
-        last_card_count = current_count
-
-        try:
-            feed.evaluate("el => el.scrollBy(0, 5000)")
-            random_delay(0.4, 0.7)
-        except Exception:
-            break
+            stagnant = 0
+        last_count = current
 
 def parse_list_cards(page: Page, locality: str, fallback: tuple[float, float]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    cards = page.locator('div.Nv2PK, div[role="feed"] > div > div[jsaction]')
-    count = cards.count()
+    """Parse restaurant cards from current page."""
+    results = []
+    article_selector = 'div[role="article"]'
+    try:
+        articles = page.locator(article_selector)
+        count = articles.count()
+        print(f"    Articles found: {count}")
+        for i in range(count):
+            try:
+                article = articles.nth(i)
+                link = article.locator('a[href*="/maps/place/"]').first
+                if link.count() == 0:
+                    link = article.locator('a').first
+                if link.count() == 0:
+                    continue
+                href = link.get_attribute("href") or ""
+                if not href.startswith("http"):
+                    href = f"https://www.google.com{href}"
 
-    for i in range(count):
-        try:
-            card = cards.nth(i)
-            link = card.locator('a.hfpxzc, a[href*="/maps/place/"]').first
-            if link.count() == 0:
-                continue
+                text = article.inner_text(timeout=2000)
+                if not text:
+                    continue
 
-            href = link.get_attribute("href") or ""
-            if not href.startswith("http"):
-                href = f"https://www.google.com{href}"
+                rating, reviews = extract_rating_reviews(text)
+                if rating is None or reviews is None:
+                    # Fallback to specific elements
+                    try:
+                        rating_el = article.locator('span[aria-hidden="true"]').first
+                        if rating_el.count() > 0:
+                            rating = parse_rating(rating_el.inner_text(timeout=500))
+                    except Exception:
+                        pass
+                    try:
+                        review_el = article.locator('span[aria-label*="reviews"]').first
+                        if review_el.count() > 0:
+                            reviews = parse_review_count(review_el.inner_text(timeout=500))
+                    except Exception:
+                        pass
 
-            name = ""
-            name_el = card.locator('.qBF1Pd, .fontHeadlineSmall, [class*="fontHeadline"]').first
-            if name_el.count() > 0:
-                name = name_el.inner_text(timeout=400).strip()
-            if not name:
-                aria = link.get_attribute("aria-label") or ""
-                name = aria.split("\n")[0].strip()
-            if not name:
-                continue
+                if rating is None or reviews is None:
+                    continue
+                if rating < MIN_RATING or reviews < MIN_REVIEWS:
+                    continue
 
-            card_text = card.inner_text(timeout=400)
-            rating = None
-            rating_el = card.locator('span.MW4etd, span.ZkP5Je').first
-            if rating_el.count() > 0:
-                rating = parse_rating(rating_el.inner_text(timeout=200))
-            if rating is None:
-                rating = parse_rating(card_text)
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                name = lines[0] if lines else "Unknown"
 
-            reviews = None
-            review_el = card.locator('span.UY7F9, span.RDAAZb').first
-            if review_el.count() > 0:
-                reviews = parse_review_count(review_el.inner_text(timeout=200))
-            if reviews is None:
-                reviews = parse_review_count(card_text)
-
-            if rating is None or reviews is None:
-                continue
-            if rating < MIN_RATING or reviews < MIN_REVIEWS:
-                continue
-
-            lat, lng = extract_coordinates(href, fallback)
-            results.append(
-                {
+                lat, lng = extract_coordinates(href, fallback)
+                results.append({
                     "name": name,
                     "rating": rating,
                     "review_count": reviews,
@@ -1469,12 +1630,60 @@ def parse_list_cards(page: Page, locality: str, fallback: tuple[float, float]) -
                     "longitude": lng,
                     "google_maps_url": href,
                     "place_id": extract_place_id(href),
-                }
-            )
-        except Exception:
-            continue
+                })
+            except Exception as e:
+                print(f"    Error parsing article {i}: {e}")
+                continue
+    except Exception as e:
+        print(f"    Error with article selector: {e}")
 
-    return results
+    # If no results, try alternative selectors
+    if not results:
+        print("    No results from articles, trying fallback selectors...")
+        alt_selectors = ['div.Nv2PK', 'div[role="feed"] > div > div']
+        for selector in alt_selectors:
+            try:
+                items = page.locator(selector)
+                count = items.count()
+                print(f"    Selector '{selector}' count: {count}")
+                for i in range(count):
+                    item = items.nth(i)
+                    link = item.locator('a[href*="/maps/place/"]').first
+                    if link.count() == 0:
+                        continue
+                    href = link.get_attribute("href") or ""
+                    if not href.startswith("http"):
+                        href = f"https://www.google.com{href}"
+                    text = item.inner_text(timeout=1000)
+                    rating, reviews = extract_rating_reviews(text)
+                    if rating is None or reviews is None:
+                        continue
+                    if rating < MIN_RATING or reviews < MIN_REVIEWS:
+                        continue
+                    name = text.split('\n')[0].strip() if text else ""
+                    lat, lng = extract_coordinates(href, fallback)
+                    results.append({
+                        "name": name,
+                        "rating": rating,
+                        "review_count": reviews,
+                        "locality": locality,
+                        "latitude": lat,
+                        "longitude": lng,
+                        "google_maps_url": href,
+                        "place_id": extract_place_id(href),
+                    })
+            except Exception as e:
+                print(f"    Error with fallback selector '{selector}': {e}")
+
+    # Deduplicate
+    unique = []
+    seen_keys = set()
+    for r in results:
+        key = dedupe_key(r["name"], r.get("place_id"), r.get("google_maps_url"), r["latitude"], r["longitude"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique.append(r)
+    return unique
 
 def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]:
     url = listing["google_maps_url"]
@@ -1534,6 +1743,12 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
             el = page.locator(selector).first
             if el.count() > 0:
                 href = el.get_attribute("href") or ""
+                # After: href = el.get_attribute("href") or ""
+                if href and "google.com/url" in href:
+                    parsed = parse_qs(urlparse(href).query)
+                    actual = parsed.get("q", [""])[0]
+                    if actual:
+                        href = actual
                 if href and "google.com" not in href:
                     result["website"] = href.strip()
                     metadata_sources["website"] = {"value": href.strip(), "source": "Google Maps Place Button"}
@@ -1554,6 +1769,10 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
                 if row_text and len(row_text) < 80:
                     hours.append(row_text)
             metadata_sources["opening_hours"] = {"value": hours, "source": "Google Maps Hours Panel"}
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1574,50 +1793,57 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
     return result
 
 def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, Any]]:
-    # Use the precomputed query if available, otherwise fallback
     query_str = str(target.get("query") or f"restaurants near {target['name']}, Hyderabad")
     url = f"https://www.google.com/maps/search/{quote_plus(query_str)}"
     print(f"\n📍 Scanning {target['type']}: {target['name']}")
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=35000)
-        dismiss_overlays(page)
-        random_delay(0.8, 1.4)
+        dismiss_cookie_banners(page)
+        time.sleep(1.5)
+        dismiss_cookie_banners(page)
 
-        # Handle Locality Page redirect: Click "Nearby restaurants" chip if present
         if "/maps/place/" in page.url:
             for chip_text in ("Nearby restaurants", "Restaurants", "Food"):
                 try:
                     chip = page.locator(f'button:has-text("{chip_text}")').first
                     if chip.is_visible(timeout=1500):
-                        chip.click()
+                        chip.click(timeout=2000)
                         random_delay(1.0, 1.6)
                         break
                 except Exception:
                     pass
 
-        feed_selector = 'div.Nv2PK, div[role="feed"], div[aria-label*="Results"]'
-        feed_found = False
-
+        # Wait for results
         try:
-            page.wait_for_selector(feed_selector, timeout=8000)
-            feed_found = True
-        except Exception:
-            search_box = page.locator('input#searchboxinput, input[name="q"]').first
-            if search_box.is_visible(timeout=2000):
-                search_box.click()
-                search_box.fill(query_str)
-                search_box.press("Enter")
-                random_delay(1.2, 1.8)
-                try:
-                    page.wait_for_selector(feed_selector, timeout=8000)
-                    feed_found = True
-                except Exception:
-                    feed_found = False
-
-        if not feed_found:
-            print(f"  ⚠️ No feed found for {target['name']}")
+            page.wait_for_selector('div[role="article"]', timeout=20000, state="visible")
+            print("    Results loaded.")
+        except PlaywrightTimeout:
+            print("    ⚠️ No articles found after 20s.")
             return []
+
+        # Sort by top rated (optional)
+        try_sort_by_rating(page)
+
+        # Scroll to load all results
+        scroll_feed(page, max_scrolls=50, max_time=30.0)
+
+        locality_for_card = str(target["name"]) if target.get("type") == "locality" else ""
+
+        listings = parse_list_cards(page, locality_for_card, (float(target["lat"]), float(target["lon"])))
+        print(f"  ↳ Found {len(listings)} qualifying places (4.0+ ★ & 1K+ reviews)")
+
+        detailed: list[dict[str, Any]] = []
+        for idx, listing in enumerate(listings, start=1):
+            print(f"    [{idx}/{len(listings)}] Details: {listing['name']} ({listing['rating']}★, {listing['review_count']:,} reviews)...")
+            try:
+                detailed.append(extract_place_details(page, listing))
+                random_delay(0.3, 0.6)
+            except Exception as exc:
+                listing["scrape_error"] = str(exc)
+                detailed.append(listing)
+
+        return detailed
 
     except PlaywrightTimeout:
         print(f"  ⚠️ Timeout loading feed for: {target['name']}")
@@ -1625,22 +1851,6 @@ def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, 
     except Exception as exc:
         print(f"  ⚠️ Error on {target['name']}: {exc}")
         return []
-
-    scroll_feed(page, max_scrolls=25)
-    listings = parse_list_cards(page, str(target["name"]), (float(target["lat"]), float(target["lon"])))
-    print(f"  ↳ Found {len(listings)} qualifying places (4.0+ ★ & 1K+ reviews)")
-
-    detailed: list[dict[str, Any]] = []
-    for idx, listing in enumerate(listings, start=1):
-        print(f"    [{idx}/{len(listings)}] Details: {listing['name']} ({listing['rating']}★, {listing['review_count']:,} reviews)...")
-        try:
-            detailed.append(extract_place_details(page, listing))
-            random_delay(0.3, 0.6)
-        except Exception as exc:
-            listing["scrape_error"] = str(exc)
-            detailed.append(listing)
-
-    return detailed
 
 def run_scraper(
     max_targets: int | None = None,
@@ -1664,21 +1874,32 @@ def run_scraper(
         )
         page = context.new_page()
 
-        # Warm-up navigation
         try:
             page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=20000)
-            dismiss_overlays(page)
+            dismiss_cookie_banners(page)
             random_delay(0.8, 1.2)
         except Exception:
             pass
 
         for idx, target in enumerate(targets, start=1):
             if progress_callback:
-                progress_callback({"status": "scraping", "current": idx, "total": len(targets), "target": target["name"]})
+                progress_callback({
+                    "status": "scraping",
+                    "current": idx,
+                    "total": len(targets),
+                    "target": target["name"],
+                    "message": f"Scraping {target['name']} ({idx}/{len(targets)})"
+                })
 
             places = scrape_target(page, target)
             for place in places:
-                key = dedupe_key(place["name"], place.get("place_id"), place["latitude"], place["longitude"])
+                key = dedupe_key(
+                    place["name"],
+                    place.get("place_id"),
+                    place.get("google_maps_url"),
+                    place["latitude"],
+                    place["longitude"]
+                )
                 if key not in seen:
                     seen.add(key)
                     all_places.append(place)
@@ -1798,9 +2019,11 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 FILE: ./scraper/menu_extractor.py
 ==================================================
 
-"""Menu extraction from Google Maps DOM and QR code scanning from photos."""
+"""Menu extraction from Google Maps DOM and QR/photo OCR."""
 from __future__ import annotations
 
+import io
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -1820,6 +2043,13 @@ try:
     PYZBAR_AVAILABLE = True
 except ImportError:
     PYZBAR_AVAILABLE = False
+
+try:
+    from PIL import Image
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
 
 def _scan_qr_from_bytes(image_bytes: bytes) -> str | None:
     if not CV2_AVAILABLE or not PYZBAR_AVAILABLE:
@@ -1850,8 +2080,57 @@ def _download_image(url: str) -> bytes | None:
         pass
     return None
 
+def _ocr_image_bytes(image_bytes: bytes) -> str:
+    if not TESSERACT_AVAILABLE:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        text = pytesseract.image_to_string(img)
+        return text.strip()
+    except Exception:
+        return ""
+
+def _ocr_image_with_google_vision(image_bytes: bytes) -> str:
+    try:
+        from google.cloud import vision
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=image_bytes)
+        response = client.text_detection(image=image)
+        texts = response.text_annotations
+        if texts:
+            return texts[0].description.strip()
+        return ""
+    except Exception:
+        return ""
+
+def _ocr_image(image_bytes: bytes) -> str:
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        text = _ocr_image_with_google_vision(image_bytes)
+        if text:
+            return text
+    return _ocr_image_bytes(image_bytes)
+
+def _parse_menu_text(text: str) -> list[dict[str, Any]]:
+    items = []
+    lines = text.split('\n')
+    current_category = "General"
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) < 30 and not re.search(r'[₹$]\s*\d', line):
+            current_category = line
+            continue
+        price_match = re.search(r'[₹$]\s*[\d,]+(?:\.\d{2})?', line)
+        if price_match:
+            price = price_match.group(0).replace(" ", "")
+            name = line.replace(price, "").strip(" -:—\t")
+            items.append({"category": current_category, "name": name or line, "price": price, "description": ""})
+    return items
+
 def _parse_menu_dom(page: Page) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+    # existing DOM parsing code (abbreviated)
+    items = []
     selectors = [
         'div[aria-label*="Menu"] div[class*="fontBodyMedium"]',
         'div[data-section-id="menu"] div',
@@ -1869,14 +2148,7 @@ def _parse_menu_dom(page: Page) -> list[dict[str, Any]]:
                 price_match = re.search(r"[₹$]\s*[\d,]+(?:\.\d{2})?", text)
                 if price_match:
                     name = text.replace(price_match.group(0), "").strip(" -—:\n\t")
-                    items.append(
-                        {
-                            "category": current_category,
-                            "name": name or text,
-                            "price": price_match.group(0).replace(" ", ""),
-                            "description": "",
-                        }
-                    )
+                    items.append({"category": current_category, "name": name or text, "price": price_match.group(0).replace(" ", ""), "description": ""})
                 elif len(text) < 40 and not re.search(r"\d", text):
                     current_category = text
             if items:
@@ -1918,10 +2190,8 @@ def _scan_menu_photos(page: Page) -> dict[str, Any]:
     return result
 
 def extract_menu_for_place(page: Page) -> dict[str, Any] | None:
-    items: list[dict[str, Any]] = []
+    items = []
     source = ""
-    
-    # Strictly target tabs within the restaurant's tablist
     menu_tab_selectors = [
         'div[role="tablist"] button[role="tab"]:has-text("Menu")',
         'button[role="tab"][aria-label*="Menu"]',
@@ -1946,7 +2216,24 @@ def extract_menu_for_place(page: Page) -> dict[str, Any] | None:
         if qr_data.get("qr_menu_url"):
             source = "In-Store QR Code Scan"
         elif qr_data.get("menu_images"):
-            source = "Google Maps Menu Photo Gallery"
+            source = "Google Maps Menu Photo Gallery (OCR)"
+            ocr_texts = []
+            for img_url in qr_data["menu_images"][:5]:
+                img_bytes = _download_image(img_url)
+                if img_bytes:
+                    ocr_text = _ocr_image(img_bytes)
+                    if ocr_text:
+                        ocr_texts.append(ocr_text)
+                        items.extend(_parse_menu_text(ocr_text))
+            if items:
+                return {
+                    "items": items,
+                    "source": source,
+                    "qr_menu_url": qr_data.get("qr_menu_url"),
+                    "menu_images": qr_data["menu_images"],
+                    "ocr_text": "\n".join(ocr_texts),
+                    "extracted_at": datetime.now(timezone.utc).isoformat(),
+                }
 
     if not items and not qr_data.get("qr_menu_url") and not qr_data.get("menu_images"):
         return None
@@ -1963,15 +2250,14 @@ def extract_menu_for_place(page: Page) -> dict[str, Any] | None:
 FILE: ./scraper/social_scourer.py
 ==================================================
 
-"""Keyless Reddit and DuckDuckGo context scraper for LLM enrichment."""
-
+"""Keyless Reddit, DuckDuckGo, and Google News context scraper for LLM enrichment."""
 from __future__ import annotations
 
 import re
 import time
 from typing import Any
-
 import httpx
+from urllib.parse import quote_plus
 
 REDDIT_SEARCH = "https://www.reddit.com/r/hyderabad/search.json"
 HEADERS = {
@@ -1979,26 +2265,21 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-
 def _sanitize(text: str, max_len: int = 500) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_len]
 
-
-def fetch_reddit_mentions(restaurant_name: str, limit: int = 10) -> list[dict[str, str]]:
-    results: list[dict[str, str]] = []
+def fetch_reddit_mentions(restaurant_name: str, limit: int = 20) -> list[dict[str, str]]:
+    results = []
     try:
         with httpx.Client(timeout=20.0, headers=HEADERS, follow_redirects=True) as client:
-            resp = client.get(
-                REDDIT_SEARCH,
-                params={
-                    "q": restaurant_name,
-                    "restrict_sr": "1",
-                    "limit": limit,
-                    "sort": "relevance",
-                },
-            )
+            resp = client.get(REDDIT_SEARCH, params={
+                "q": restaurant_name,
+                "restrict_sr": "1",
+                "limit": limit,
+                "sort": "relevance",
+            })
             if resp.status_code != 200:
                 return results
             data = resp.json()
@@ -2008,72 +2289,95 @@ def fetch_reddit_mentions(restaurant_name: str, limit: int = 10) -> list[dict[st
                 title = _sanitize(pd.get("title", ""), 200)
                 body = _sanitize(pd.get("selftext", ""), 400)
                 if title or body:
-                    results.append(
-                        {
-                            "source": "Reddit r/hyderabad",
-                            "title": title,
-                            "snippet": body or title,
-                            "url": f"https://reddit.com{pd.get('permalink', '')}",
-                        }
-                    )
+                    results.append({
+                        "source": "Reddit r/hyderabad",
+                        "title": title,
+                        "snippet": body or title,
+                        "url": f"https://reddit.com{pd.get('permalink', '')}",
+                    })
             time.sleep(1.0)
     except Exception:
         pass
     return results
 
-
-def fetch_duckduckgo_mentions(restaurant_name: str, max_results: int = 5) -> list[dict[str, str]]:
-    results: list[dict[str, str]] = []
+def fetch_duckduckgo_mentions(restaurant_name: str, max_results: int = 10) -> list[dict[str, str]]:
+    results = []
     query = f"{restaurant_name} Hyderabad food review menu blog"
-    # FIX: import inside try, but keep search logic at the same level
+    DDGS = None
     try:
         from ddgs import DDGS
     except ImportError:
-        from duckduckgo_search import DDGS
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            DDGS = None
+
+    if DDGS is None:
+        return results  # can't use DDG, skip
 
     try:
         with DDGS() as ddgs:
             for item in ddgs.text(query, max_results=max_results):
-                results.append(
-                    {
-                        "source": "DuckDuckGo Web",
-                        "title": _sanitize(item.get("title", ""), 200),
-                        "snippet": _sanitize(item.get("body", ""), 400),
-                        "url": item.get("href", ""),
-                    }
-                )
+                results.append({
+                    "source": "DuckDuckGo Web",
+                    "title": _sanitize(item.get("title", ""), 200),
+                    "snippet": _sanitize(item.get("body", ""), 400),
+                    "url": item.get("href", ""),
+                })
         time.sleep(0.5)
     except Exception:
-        # Fallback to HTML scraping if DDGS fails
+        # Fallback to HTML scraping (simplified)
         try:
             with httpx.Client(timeout=20.0, headers=HEADERS) as client:
-                resp = client.get(
-                    "https://html.duckduckgo.com/html/",
-                    params={"q": query},
-                )
+                resp = client.get("https://html.duckduckgo.com/html/", params={"q": query})
                 if resp.status_code == 200:
-                    snippets = re.findall(
-                        r'class="result__snippet"[^>]*>([^<]+)',
-                        resp.text,
-                    )[:max_results]
-                    for i, snip in enumerate(snippets):
-                        results.append(
-                            {
-                                "source": "DuckDuckGo HTML Fallback",
-                                "title": query,
-                                "snippet": _sanitize(snip, 400),
-                                "url": "",
-                            }
-                        )
+                    # Use regex to extract snippets
+                    snippets = re.findall(r'class="result__snippet"[^>]*>([^<]+)', resp.text)[:max_results]
+                    for snip in snippets:
+                        results.append({
+                            "source": "DuckDuckGo HTML Fallback",
+                            "title": query,
+                            "snippet": _sanitize(snip, 400),
+                            "url": "",
+                        })
         except Exception:
             pass
     return results
 
+def fetch_google_news_mentions(restaurant_name: str, max_results: int = 5) -> list[dict[str, str]]:
+    """Fetch recent Google News mentions via RSS."""
+    results = []
+    query = quote_plus(f"{restaurant_name} Hyderabad food")
+    rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.get(rss_url)
+            if resp.status_code != 200:
+                return results
+            items = re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL)
+            for item in items[:max_results]:
+                title_match = re.search(r"<title>(.*?)</title>", item)
+                link_match = re.search(r"<link>(.*?)</link>", item)
+                desc_match = re.search(r"<description>(.*?)</description>", item)
+                title = _sanitize(title_match.group(1) if title_match else "", 200)
+                snippet = _sanitize(desc_match.group(1) if desc_match else "", 400)
+                url = link_match.group(1) if link_match else ""
+                if title:
+                    results.append({
+                        "source": "Google News",
+                        "title": title,
+                        "snippet": snippet,
+                        "url": url,
+                    })
+    except Exception:
+        pass
+    return results
 
 def build_context_summary(restaurant_name: str) -> dict[str, Any]:
     reddit = fetch_reddit_mentions(restaurant_name)
     ddg = fetch_duckduckgo_mentions(restaurant_name)
-    all_mentions = reddit + ddg
+    gnews = fetch_google_news_mentions(restaurant_name)
+    all_mentions = reddit + ddg + gnews
 
     lines = [f"=== Social Context for {restaurant_name} ==="]
     for m in all_mentions:
@@ -2088,18 +2392,15 @@ def build_context_summary(restaurant_name: str) -> dict[str, Any]:
         "restaurant_name": restaurant_name,
         "reddit_count": len(reddit),
         "web_count": len(ddg),
+        "news_count": len(gnews),
         "mentions": all_mentions,
         "summary_text": summary_text[:8000],
     }
 
-
 def scour_restaurant(restaurant: dict[str, Any]) -> dict[str, Any]:
     name = restaurant.get("name", "")
     context = build_context_summary(name)
-    return {
-        "restaurant_name": name,
-        "social_context": context,
-    }
+    return {"restaurant_name": name, "social_context": context}
 
 ==================================================
 FILE: ./pipeline/__init__.py
@@ -2112,8 +2413,7 @@ FILE: ./pipeline/__init__.py
 FILE: ./pipeline/analyzer.py
 ==================================================
 
-"""Local Ollama batch analyzer with strict JSON schema enforcement."""
-
+"""Restaurant analyzer using multi‑provider LLM."""
 from __future__ import annotations
 
 import json
@@ -2123,9 +2423,7 @@ from typing import Any
 
 import httpx
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "qwen3:8b"
-FALLBACK_MODEL = "llama3.1:8b"
+from pipeline.llm_client import LLMClient
 
 SYSTEM_PROMPT = """You are a Hyderabad food intelligence analyst. Analyze the restaurant using ONLY the provided data.
 Respond with ONLY valid JSON matching this exact schema (no markdown, no extra text):
@@ -2170,6 +2468,14 @@ SCHEMA_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y")
+    return bool(value)
+
+
 def _build_prompt(restaurant: dict[str, Any], social_context: dict[str, Any] | None) -> str:
     menu_items = restaurant.get("raw_menu") or restaurant.get("raw_menu_json") or []
     if isinstance(menu_items, str):
@@ -2192,10 +2498,9 @@ def _build_prompt(restaurant: dict[str, Any], social_context: dict[str, Any] | N
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    # Remove thinking tags (common in reasoning models)
     text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     try:
         return json.loads(text)
@@ -2236,54 +2541,12 @@ def _validate_schema(data: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result[list_key], list):
             result[list_key] = SCHEMA_DEFAULTS[list_key]
 
-    result["is_pure_veg"] = bool(result.get("is_pure_veg"))
-    result["open_late_night"] = bool(result.get("open_late_night"))
+    result["is_pure_veg"] = _to_bool(result.get("is_pure_veg", False))
+    result["open_late_night"] = _to_bool(result.get("open_late_night", False))
     return result
 
 
-def _call_ollama(prompt: str, model: str = DEFAULT_MODEL, timeout: float = 120.0) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "system": SYSTEM_PROMPT,
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.3, "num_predict": 1024},
-    }
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(OLLAMA_URL, json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "")
-
-
-def analyze_restaurant(
-    restaurant: dict[str, Any],
-    social_context: dict[str, Any] | None = None,
-    model: str = DEFAULT_MODEL,
-) -> dict[str, Any]:
-    prompt = _build_prompt(restaurant, social_context)
-    models_to_try = [model]
-    if model != FALLBACK_MODEL:
-        models_to_try.append(FALLBACK_MODEL)
-
-    last_error = None
-    for m in models_to_try:
-        try:
-            raw = _call_ollama(prompt, model=m)
-            parsed = _extract_json(raw)
-            return _validate_schema(parsed)
-        except Exception as exc:
-            last_error = exc
-            time.sleep(1.0)
-
-    fallback = _validate_schema({})
-    fallback["hype_analysis_summary"] = f"LLM analysis unavailable: {last_error}. Using heuristic defaults."
-    fallback.update(_heuristic_analysis(restaurant))
-    return fallback
-
-
 def _heuristic_analysis(restaurant: dict[str, Any]) -> dict[str, Any]:
-    """Offline heuristic fallback when Ollama is unavailable."""
     name_lower = (restaurant.get("name") or "").lower()
     rating = restaurant.get("rating") or 4.0
     reviews = restaurant.get("review_count") or 1000
@@ -2318,35 +2581,46 @@ def _heuristic_analysis(restaurant: dict[str, Any]) -> dict[str, Any]:
         "dietary_warning_remarks": remarks,
         "calculated_spend_for_two": 600 if "budget" in name_lower else 900,
         "budget_tier": "Moderate (₹500-₹1200)",
+        "must_try_items": [],
+        "skip_items": [],
+        "red_flags": [],
+        "vibe_tags": ["Family Dining"],
+        "open_late_night": False,
     }
 
 
-def batch_analyze(
-    restaurants: list[dict[str, Any]],
-    social_contexts: dict[str, dict[str, Any]] | None = None,
-    model: str = DEFAULT_MODEL,
-    progress_callback=None,
-) -> list[dict[str, Any]]:
+def analyze_restaurant(restaurant: dict[str, Any], social_context: dict[str, Any] | None = None, model: str | None = None) -> dict[str, Any]:
+    prompt = _build_prompt(restaurant, social_context)
+    try:
+        client = LLMClient(SYSTEM_PROMPT)
+        parsed = client.complete_json(prompt, model=model)
+        return _validate_schema(parsed)
+    except Exception as exc:
+        fallback = _validate_schema({})
+        fallback["hype_analysis_summary"] = f"LLM analysis unavailable: {exc}. Using heuristic defaults."
+        fallback.update(_heuristic_analysis(restaurant))
+        return fallback
+
+
+def batch_analyze(restaurants, social_contexts=None, model=None, progress_callback=None):
     social_contexts = social_contexts or {}
     results = []
     total = len(restaurants)
-
     for idx, restaurant in enumerate(restaurants, start=1):
         name = restaurant.get("name", "")
-        ctx = social_contexts.get(name)
+        ctx = social_contexts.get(idx - 1)
         if progress_callback:
-            progress_callback({"current": idx, "total": total, "name": name})
-
+            progress_callback({"current": idx, "total": total, "name": name, "message": f"Analyzing {name} ({idx}/{total})"})
         analysis = analyze_restaurant(restaurant, ctx, model=model)
         enriched = dict(restaurant)
         enriched["ai_analysis"] = analysis
         results.append(enriched)
         time.sleep(0.5)
-
     return results
 
 
-def check_ollama_available(model: str = DEFAULT_MODEL) -> bool:
+def check_ollama_available(model: str = "qwen3:8b") -> bool:
+    """Check if local Ollama is available and has the model."""
     try:
         with httpx.Client(timeout=5.0) as client:
             resp = client.get("http://localhost:11434/api/tags")
@@ -2368,15 +2642,17 @@ from __future__ import annotations
 from urllib.parse import quote_plus
 
 
+# pipeline/discount_helper.py
+"""Pre-booking deal search links for Swiggy Dineout and Zomato Gold."""
+from urllib.parse import quote_plus
+
 def swiggy_dineout_url(restaurant_name: str, locality: str = "Hyderabad") -> str:
     query = quote_plus(f"{restaurant_name} {locality}")
-    return f"https://www.swiggy.com/restaurants/{query}"
-
+    return f"https://www.swiggy.com/search?query={query}"
 
 def zomato_gold_url(restaurant_name: str, locality: str = "Hyderabad") -> str:
     query = quote_plus(f"{restaurant_name} {locality}")
-    return f"https://www.zomato.com/hyderabad/restaurants/{query}"
-
+    return f"https://www.zomato.com/hyderabad/restaurants?q={query}&category=1"
 
 def get_deal_links(restaurant: dict) -> dict[str, str]:
     name = restaurant.get("name", "")
@@ -2385,7 +2661,7 @@ def get_deal_links(restaurant: dict) -> dict[str, str]:
         "swiggy_dineout": swiggy_dineout_url(name, locality),
         "zomato_gold": zomato_gold_url(name, locality),
     }
-
+    
 
 def whatsapp_share_text(restaurant: dict) -> str:
     ai = restaurant.get("ai_analysis") or {}
@@ -2417,6 +2693,121 @@ def whatsapp_share_text(restaurant: dict) -> str:
 def whatsapp_share_url(restaurant: dict) -> str:
     text = quote_plus(whatsapp_share_text(restaurant))
     return f"https://wa.me/?text={text}"
+
+==================================================
+FILE: ./pipeline/llm_client.py
+==================================================
+
+"""Multi‑provider LLM client with fallback and rate‑limit handling."""
+from __future__ import annotations
+
+import json
+import os
+import time
+from typing import Any
+
+import httpx
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+
+PROVIDERS = {
+    "groq": {
+        "api_key_env": "GROQ_API_KEY",          # <-- name of env var
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "default_model": "llama3-8b-8192",
+        "type": "openai",
+    },
+    "openai": {
+        "api_key_env": "OPENAI_API_KEY",        # <-- name of env var
+        "url": "https://api.openai.com/v1/chat/completions",
+        "default_model": "gpt-4o-mini",
+        "type": "openai",
+    },
+    "ollama": {
+        "api_key_env": None,
+        "url": OLLAMA_URL,
+        "default_model": "qwen3:8b",
+        "type": "ollama",
+    },
+}
+
+class LLMClient:
+    def __init__(self, system_prompt: str):
+        self.system_prompt = system_prompt
+    def _get_available_providers(self) -> list[str]:
+        providers = []
+        for name, cfg in PROVIDERS.items():
+            if name == "ollama":
+                try:
+                    with httpx.Client(timeout=2.0) as client:
+                        resp = client.get("http://localhost:11434/api/tags")
+                        if resp.status_code == 200:
+                            providers.append(name)
+                except Exception:
+                    pass
+            else:
+                if os.getenv(cfg["api_key_env"]):
+                    providers.append(name)
+        priority = ["groq", "openai", "ollama"]
+        return [p for p in priority if p in providers]
+
+    def _call_provider(self, provider: str, prompt: str, model: str | None = None, timeout: float = 60.0) -> str:
+        cfg = PROVIDERS[provider]
+        if provider == "ollama":
+            payload = {
+                "model": model or cfg["default_model"],
+                "prompt": prompt,
+                "system": self.system_prompt,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": 0.3, "num_predict": 1024},
+            }
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(cfg["url"], json=payload)
+                resp.raise_for_status()
+                return resp.json().get("response", "")
+        else:
+            headers = {
+                "Authorization": f"Bearer {os.getenv(cfg['api_key_env'])}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model or cfg["default_model"],
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 1024,
+            }
+            if provider == "groq":
+                payload["response_format"] = {"type": "json_object"}
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(cfg["url"], headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+
+    def complete_json(self, prompt: str, model: str | None = None, max_retries: int = 2) -> dict[str, Any]:
+        providers = self._get_available_providers()
+        if not providers:
+            raise RuntimeError("No LLM providers available (set GROQ_API_KEY, OPENAI_API_KEY, or run Ollama)")
+
+        last_error = None
+        for provider in providers:
+            for attempt in range(max_retries):
+                try:
+                    raw = self._call_provider(provider, prompt, model=model)
+                    cleaned = raw.strip()
+                    if cleaned.startswith("```"):
+                        cleaned = cleaned.strip("`")
+                        if cleaned.lower().startswith("json"):
+                            cleaned = cleaned[4:]
+                    return json.loads(cleaned)
+                except Exception as e:
+                    last_error = e
+                    time.sleep(1.0 * (attempt + 1))
+        raise RuntimeError(f"All providers failed: {last_error}")
 
 ==================================================
 FILE: ./config/targets.py
@@ -2551,99 +2942,26 @@ def get_named_localities() -> dict[str, tuple[float, float]]:
 FILE: ./static/css/style.css
 ==================================================
 
-/* Minimal custom styles – Tailwind handles most */
-#map {
-    width: 100%;
-    height: 100%;
-}
-.dist-chip.active {
-    background-color: #1e293b;
-    color: white;
-    border-color: #1e293b;
-}
+:root{--ink:#07080d;--ink2:#0c0f17;--panel:rgba(14,18,28,.82);--panel2:#101522;--line:rgba(255,255,255,.10);--muted:#748097;--text:#edf1f7;--cream:#f4eee3;--blue:#7e8cff;--cyan:#61e6ff;--green:#7dffca;--orange:#ffb36a;--red:#ff7188;--serif:'Playfair Display',serif;--sans:'DM Sans',sans-serif;--display:'Space Grotesk',sans-serif;--shadow:0 28px 90px rgba(0,0,0,.34)}
+*{box-sizing:border-box}html{background:#07080d}body{margin:0;background:radial-gradient(circle at 12% -10%,rgba(114,132,255,.15),transparent 28%),radial-gradient(circle at 92% 20%,rgba(97,230,255,.08),transparent 25%),#07080d;color:var(--text);font-family:var(--sans);letter-spacing:-.01em;overflow:hidden}body.is-map-moving{cursor:grabbing}a{color:inherit}.grain{position:fixed;inset:0;pointer-events:none;z-index:10000;opacity:.055;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E")} .ambient{position:fixed;width:42vw;height:42vw;border-radius:50%;filter:blur(90px);opacity:.18;pointer-events:none;z-index:-1}.ambient-a{background:#6f72ff;left:-18vw;top:18vh}.ambient-b{background:#0fe1ff;right:-18vw;bottom:-15vw}.cursor-glow{position:fixed;left:0;top:0;width:240px;height:240px;transform:translate3d(-999px,-999px,0);pointer-events:none;z-index:9999;border-radius:50%;background:radial-gradient(circle,rgba(126,140,255,.11),transparent 65%);mix-blend-mode:screen}.topbar{height:63px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(7,8,13,.78);backdrop-filter:blur(24px);position:relative;z-index:2000}.brand{display:flex;align-items:center;gap:10px;text-decoration:none}.brand-mark{display:flex;width:34px;height:34px;border:1px solid rgba(255,255,255,.16);border-radius:10px;align-items:center;justify-content:center;gap:1px;background:linear-gradient(135deg,#1b2140,#0d111b);box-shadow:inset 0 0 30px rgba(126,140,255,.14),0 10px 25px rgba(0,0,0,.25);font:700 11px var(--display);letter-spacing:-.1em}.brand-mark span:last-child{transform:translateY(3px);color:#8791ff}.brand-word strong{display:block;font:700 13px var(--display);letter-spacing:-.03em}.brand-word small{display:block;color:#566176;font-size:8px;margin-top:1px;letter-spacing:.03em}.topbar-right{display:flex;align-items:center;gap:13px}.live-pill{display:flex;align-items:center;gap:6px;font:700 8px var(--display);letter-spacing:.12em;color:#94e6c5}.live-pill i{width:5px;height:5px;border-radius:50%;background:#7dffca;box-shadow:0 0 12px #7dffca;animation:blink 1.7s ease-in-out infinite}.meta-copy{color:#545f73;font-size:9px}.top-action{font:600 9px var(--display);color:#dbe1eb;text-decoration:none;border:1px solid rgba(255,255,255,.1);border-radius:999px;padding:8px 11px;background:rgba(255,255,255,.03);transition:.3s}.top-action:hover{border-color:rgba(126,140,255,.45);transform:translateY(-1px)}
+.app-shell{height:calc(100vh - 63px);display:flex}.sidebar{width:410px;min-width:410px;background:linear-gradient(180deg,rgba(12,15,23,.96),rgba(9,12,18,.96));border-right:1px solid rgba(255,255,255,.08);position:relative;z-index:1200;transition:width .45s cubic-bezier(.77,0,.18,1),transform .45s cubic-bezier(.77,0,.18,1);box-shadow:30px 0 90px rgba(0,0,0,.22)}.sidebar.collapsed{width:0;min-width:0;transform:translateX(-100%)}.sidebar-scroll{height:100%;padding:23px 17px 40px;overflow:auto;scrollbar-width:thin;scrollbar-color:#2c3442 transparent}.sidebar-scroll::-webkit-scrollbar{width:4px}.sidebar-scroll::-webkit-scrollbar-thumb{background:#2c3442;border-radius:99px}.sidebar-head{display:flex;justify-content:space-between;gap:12px;padding:4px 2px 18px}.eyebrow{font:700 8px var(--display);letter-spacing:.16em;color:#5d687c}.sidebar-head h1{font:700 34px var(--display);letter-spacing:-.06em;margin:8px 0 7px;line-height:.95}.sidebar-head h1 em{font:700 italic 38px var(--serif);color:#d8d2c7}.sidebar-head p{font-size:10px;line-height:1.6;color:#697589;max-width:310px;margin:0}.icon-btn{width:29px;height:29px;border-radius:50%;border:1px solid rgba(255,255,255,.11);background:#10151f;color:#9ca7b7;font-size:22px;line-height:1;cursor:pointer}.search-panel,.filter-card,.location-card,.pipeline-card{border:1px solid var(--line);background:linear-gradient(145deg,rgba(18,23,35,.93),rgba(11,15,23,.93));border-radius:18px;padding:12px;box-shadow:0 18px 50px rgba(0,0,0,.18);margin-bottom:10px}.search-wrap{position:relative;display:flex;align-items:center}.search-icon{position:absolute;left:12px;color:#67748a;font-size:18px;line-height:1;pointer-events:none}.search-wrap input{width:100%;background:#0a0e16;border:1px solid rgba(255,255,255,.08);color:#edf1f7;border-radius:13px;height:44px;padding:0 55px 0 34px;outline:none;font-size:11px;transition:.25s}.search-wrap input::placeholder{color:#505c70}.search-wrap input:focus{border-color:rgba(126,140,255,.55);box-shadow:0 0 0 4px rgba(126,140,255,.08),inset 0 0 35px rgba(126,140,255,.05)}kbd{position:absolute;right:10px;border:1px solid #252d3c;color:#67738a;padding:3px 5px;border-radius:5px;font:600 8px var(--display);background:#101521}.quick-row{display:flex;gap:6px;margin-top:9px;flex-wrap:wrap}.quick-chip,.dist-chip{border:1px solid rgba(255,255,255,.08);background:#0b1018;color:#758196;border-radius:999px;padding:7px 9px;font-size:8px;cursor:pointer;transition:.28s}.quick-chip:hover,.quick-chip.active,.dist-chip:hover,.dist-chip.active{background:#e9eee9;color:#0b0e13;border-color:#e9eee9;box-shadow:0 8px 20px rgba(233,238,233,.08)}.quick-chip i{display:inline-block;width:4px;height:4px;border-radius:50%;background:#7dffca;box-shadow:0 0 8px #7dffca;margin-right:3px}.section-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:11px;font:700 10px var(--display);color:#c8cfda}.reset-btn{border:0;background:none;color:#68758a;font:600 8px var(--display);cursor:pointer}.reset-btn b{background:#8790ff;color:#fff;border-radius:999px;padding:3px 5px;margin-left:3px}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.field{display:block;margin-bottom:8px}.field>span{display:block;font:600 8px var(--display);color:#68758a;margin-bottom:5px;text-transform:uppercase;letter-spacing:.08em}.field input,.field select{width:100%;background:#0b1018;color:#dfe5ef;border:1px solid rgba(255,255,255,.07);border-radius:10px;min-height:35px;padding:7px 9px;outline:none;font:500 9px var(--sans);transition:.25s}.field input:focus,.field select:focus{border-color:rgba(126,140,255,.55);box-shadow:0 0 0 3px rgba(126,140,255,.07)}.field select[multiple]{height:auto;min-height:85px;overflow:hidden}.field select option{padding:6px;border-radius:5px}.field select option:checked{background:linear-gradient(90deg,#1e2652,#26305e);color:#dce0ff}.field small{display:block;color:#414d60;font-size:7px;margin-top:4px}.toggle-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 8px;padding-top:4px}.toggle{font-size:8px;color:#7d889b;cursor:pointer}.toggle input{display:none}.toggle span{display:flex;align-items:center;gap:6px}.toggle i{width:27px;height:15px;border-radius:999px;background:#161c28;border:1px solid rgba(255,255,255,.07);position:relative;transition:.25s}.toggle i:after{content:'';position:absolute;top:2px;left:2px;width:9px;height:9px;border-radius:50%;background:#606b7e;transition:.25s}.toggle input:checked+span i{background:#6978ff;box-shadow:0 0 16px rgba(105,120,255,.2)}.toggle input:checked+span i:after{left:14px;background:#fff}.location-card{display:grid;grid-template-columns:33px 1fr;gap:8px;align-items:center}.location-orbit{width:33px;height:33px;border-radius:50%;position:relative;display:grid;place-items:center;color:#7dffca;background:rgba(125,255,202,.08);border:1px solid rgba(125,255,202,.16)}.location-orbit .orbit-ring{position:absolute;inset:-5px;border:1px dashed rgba(125,255,202,.25);border-radius:50%;animation:spin 8s linear infinite}.location-copy strong,.pipeline-card strong{display:block;font:700 10px var(--display);color:#e0e5ee}.location-copy small,.pipeline-card small{display:block;color:#5f6b80;font-size:8px;margin-top:2px}.primary-btn,.pipeline-btn,.ghost-btn,.deal{display:inline-flex;align-items:center;justify-content:center;gap:8px;border-radius:11px;text-decoration:none;border:1px solid transparent;padding:10px 13px;font-size:9px;font-weight:700;transition:transform .3s,box-shadow .3s,border-color .3s}.primary-btn{grid-column:1/-1;width:100%;background:linear-gradient(135deg,#8994ff,#5ee5ff);color:#080c14;box-shadow:0 15px 30px rgba(105,124,255,.16)}.primary-btn.location-live{background:linear-gradient(135deg,#69f2bd,#9bffd7);box-shadow:0 15px 32px rgba(73,221,162,.18)}.primary-btn:hover,.pipeline-btn:hover,.deal:hover,.ghost-btn:hover{transform:translateY(-2px)}.distance-row{grid-column:1/-1;display:flex;gap:5px}.pipeline-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.pipeline-orb{width:22px;height:22px;border-radius:50%;border:1px solid rgba(126,140,255,.25);box-shadow:inset 0 0 15px rgba(126,140,255,.12),0 0 20px rgba(126,140,255,.08);position:relative}.pipeline-orb:after{content:'';position:absolute;inset:5px;border-radius:50%;background:#8290ff;box-shadow:0 0 12px #8290ff;animation:blink 1.8s ease-in-out infinite}.pipeline-btn{width:100%;margin-top:10px;background:#121a2b;border-color:rgba(126,140,255,.18);color:#aeb8ff}.pipeline-btn.running{background:linear-gradient(135deg,#26335f,#15213b);box-shadow:0 0 35px rgba(126,140,255,.1)}.pipeline-status{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08)}.pipeline-line{display:flex;justify-content:space-between;gap:8px;color:#7d89a0;font-size:8px}.pipeline-percent{color:#dfe5ef;font:700 8px var(--display)}.pipeline-track{height:4px;background:#171d29;border-radius:99px;margin-top:6px;overflow:hidden;position:relative}.pipeline-track>div{height:100%;width:0;background:linear-gradient(90deg,#6f7cff,#63e7ff);border-radius:99px;box-shadow:0 0 15px rgba(99,231,255,.38);transition:width .65s cubic-bezier(.4,0,.2,1)}.pipeline-track i{position:absolute;top:0;bottom:0;width:40px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.6),transparent);filter:blur(2px);animation:shimmer 1.2s linear infinite}.list-heading{display:flex;justify-content:space-between;align-items:center;padding:7px 2px 9px}.list-heading b{font:700 11px var(--display);color:#e0e5ef}.list-sort-hint{font-size:7px;color:#465267}.restaurant-list{list-style:none;padding:0;margin:0;display:grid;gap:6px}.restaurant-card{position:relative;overflow:hidden;background:linear-gradient(145deg,#10151f,#0b1018);border:1px solid rgba(255,255,255,.07);border-radius:15px;padding:12px 12px 10px 31px;cursor:pointer;transition:transform .3s,border-color .3s,background .3s,box-shadow .3s}.restaurant-card:before{content:'';position:absolute;inset:0;background:radial-gradient(circle at var(--mx,50%) var(--my,50%),rgba(126,140,255,.12),transparent 30%);opacity:0;transition:.25s}.restaurant-card:hover:before{opacity:1}.restaurant-card:hover{transform:translateX(4px);border-color:rgba(126,140,255,.35);box-shadow:0 18px 45px rgba(0,0,0,.24)}.restaurant-card.selected{border-color:#7885ff;box-shadow:0 0 0 2px rgba(126,140,255,.08),0 18px 50px rgba(66,79,185,.12)}.card-index{position:absolute;left:10px;top:12px;color:#3b4557;font:700 8px var(--display)}.r-top{display:flex;justify-content:space-between;gap:8px;position:relative}.r-name{font:700 12px var(--display);color:#eef2f8;line-height:1.15}.rating-pill{background:rgba(255,179,106,.08);color:#ffc681;border:1px solid rgba(255,179,106,.14);border-radius:999px;padding:4px 6px;font-size:8px;white-space:nowrap}.r-meta{font-size:8px;color:#606c80;margin-top:4px}.tag-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;position:relative}.tag{font-size:7px;padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:#121824;color:#7f8ca0}.tag.gem{color:#8df1c9;background:rgba(125,255,202,.06);border-color:rgba(125,255,202,.12)}.tag.hype{color:#b9c0ff;background:rgba(126,140,255,.08);border-color:rgba(126,140,255,.14)}.tag.classic{color:#ffc780;background:rgba(255,179,106,.06)}.tag.overhyped,.tag.risk{color:#ff9fae;background:rgba(255,113,136,.06);border-color:rgba(255,113,136,.12)}.r-bottom{display:flex;justify-content:space-between;align-items:center;margin-top:9px;padding-top:8px;border-top:1px solid rgba(255,255,255,.07);position:relative}.r-link{font-size:8px;color:#a8b0ff;text-decoration:none;font-weight:700}.maps-link{font-size:8px;color:#505c70;text-decoration:none}.empty-state{text-align:center;padding:45px 15px;color:#4c596e}.empty-state div{font-size:34px;color:#6572ff;animation:spin 7s linear infinite}.empty-state strong{display:block;color:#a9b3c4;font:600 14px var(--display);margin-top:6px}.empty-state p{font-size:9px}.map-stage{flex:1;min-width:0;position:relative;background:#111722;overflow:hidden}.map-canvas{position:absolute;inset:0}.map-scanline{position:absolute;z-index:760;left:0;right:0;top:0;height:1px;background:linear-gradient(90deg,transparent,rgba(126,140,255,.8),transparent);box-shadow:0 0 22px rgba(126,140,255,.32);animation:scan 7s linear infinite;pointer-events:none}.map-overlay-top{position:absolute;z-index:850;left:18px;right:18px;top:16px;display:flex;justify-content:space-between;gap:10px;pointer-events:none}.map-status,.map-hint,.map-legend,.map-bottom-note{background:rgba(6,9,15,.72);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.10);box-shadow:0 15px 45px rgba(0,0,0,.26)}.map-status{display:flex;align-items:center;gap:8px;padding:9px 11px;border-radius:999px;color:#a9b4c4;font-size:8px}.map-status i{width:5px;height:5px;border-radius:50%;background:#7dffca;box-shadow:0 0 12px #7dffca;animation:blink 1.6s ease-in-out infinite}.map-hint{padding:9px 11px;border-radius:999px;color:#566277;font:700 7px var(--display);letter-spacing:.16em}.map-center-mark{position:absolute;z-index:820;inset:50% auto auto 50%;width:26px;height:26px;transform:translate(-50%,-50%);pointer-events:none;opacity:.28}.map-center-mark span,.map-center-mark i{position:absolute;inset:0;border:1px solid rgba(126,140,255,.6);border-radius:50%}.map-center-mark i{inset:8px;background:#8a95ff;box-shadow:0 0 24px #7684ff}.map-center-mark span{animation:radar 2.4s ease-out infinite}.map-legend{position:absolute;z-index:850;bottom:15px;right:15px;border-radius:11px;padding:8px 10px;display:flex;gap:12px;color:#768297;font:700 7px var(--display);letter-spacing:.12em}.legend-dot{display:inline-block;width:5px;height:5px;border-radius:50%;margin-right:4px}.legend-dot.gem{background:#7dffca;box-shadow:0 0 8px #7dffca}.legend-dot.hype{background:#8491ff;box-shadow:0 0 8px #8491ff}.legend-dot.classic{background:#ffb36a;box-shadow:0 0 8px #ffb36a}.map-bottom-note{position:absolute;z-index:850;left:15px;bottom:15px;padding:7px 9px;border-radius:9px;color:#4c586d;font:700 7px var(--display);letter-spacing:.12em}.map-bottom-note b{color:#7d8799}.map-bottom-note span{padding:0 5px}.map-float{position:absolute;z-index:1000;top:15px;left:15px;width:38px;height:38px;border:1px solid rgba(255,255,255,.12);border-radius:50%;background:rgba(7,10,16,.85);color:#dbe1ec;font-size:20px;backdrop-filter:blur(16px)}.hidden{display:none!important}.leaflet-control-zoom{border:0!important;box-shadow:0 20px 40px rgba(0,0,0,.35)!important;overflow:hidden;border-radius:12px!important}.leaflet-control-zoom a{width:31px!important;height:31px!important;line-height:31px!important;background:#0c121c!important;color:#bfc7d5!important;border:0!important;font-weight:500}.leaflet-control-attribution{background:rgba(6,9,15,.62)!important;color:#556175!important;font-size:8px!important}.leaflet-control-attribution a{color:#7d88a0!important}.leaflet-tile{filter:brightness(.82) saturate(.82) contrast(1.05)}.food-pin-wrap{background:none!important;border:0!important}.food-pin{width:32px;height:32px;position:relative;display:grid;place-items:center}.pin-pulse{position:absolute;inset:0;border-radius:50%;border:1px solid currentColor;opacity:.18;animation:pinPulse 2.6s ease-out infinite}.pin-core{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;border:1px solid rgba(255,255,255,.72);box-shadow:0 5px 18px rgba(0,0,0,.32),0 0 18px currentColor;background:#121722;color:#fff}.pin-core span{font:700 7px var(--display)}.food-pin label{position:absolute;left:18px;top:26px;white-space:nowrap;background:rgba(6,9,15,.72);color:#c8cfda;border:1px solid rgba(255,255,255,.08);padding:3px 5px;border-radius:5px;font:600 7px var(--display);opacity:0;transform:translateY(4px);transition:.22s;pointer-events:none}.food-pin:hover label{opacity:1;transform:none}.food-pin.gem{color:#7dffca}.food-pin.hype{color:#8390ff}.food-pin.classic{color:#ffb36a}.food-pin.overhyped{color:#ff7188}.food-cluster-wrap{background:none!important;border:0!important}.food-cluster{display:grid;place-items:center;position:relative;border-radius:50%;color:#fff;background:rgba(116,130,255,.95);border:1px solid rgba(255,255,255,.75);box-shadow:0 0 0 7px rgba(116,130,255,.10),0 14px 35px rgba(0,0,0,.30);font:700 10px var(--display);animation:clusterFloat 3s ease-in-out infinite}.food-cluster:after{content:'';position:absolute;inset:-5px;border:1px dashed rgba(116,130,255,.25);border-radius:50%;animation:spin 8s linear infinite}.food-cluster.md{width:42px;height:42px}.food-cluster.lg{width:48px;height:48px}.food-cluster.xl{width:54px;height:54px}.popup-card{font-family:var(--sans);min-width:190px}.popup-kicker{color:#6e7cff;font:700 7px var(--display);letter-spacing:.14em}.popup-title{font:700 15px var(--display);margin:4px 0}.popup-meta{font-size:8px;color:#738095;margin-top:3px}.popup-meta b{color:#ffc681}.popup-actions{display:flex;gap:6px;margin-top:10px}.popup-actions a{font:700 8px var(--display);color:#9da8ff;text-decoration:none;border:1px solid rgba(126,140,255,.16);padding:6px 7px;border-radius:7px;background:#121928}.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#0d131d;color:#e7ecf3;border:1px solid rgba(255,255,255,.08);box-shadow:0 24px 60px rgba(0,0,0,.42)}.leaflet-popup-content{margin:12px!important}.leaflet-popup-close-button{color:#68758a!important}.user-popup b{display:block;font:700 11px var(--display)}.user-popup span{display:block;font-size:8px;color:#7e8ca2;margin-top:3px}
+/* restaurant */body:has(.restaurant-page){overflow:auto;background:radial-gradient(circle at 30% 0%,rgba(126,140,255,.14),transparent 32%),#07080d}.restaurant-page{max-width:1160px;margin:0 auto;padding:28px 22px 70px}.back-link{display:inline-block;color:#68758a;text-decoration:none;font:700 8px var(--display);letter-spacing:.1em;margin-bottom:18px}.restaurant-hero{display:flex;justify-content:space-between;gap:30px;padding:34px;border:1px solid var(--line);border-radius:28px;background:linear-gradient(135deg,rgba(18,23,35,.96),rgba(9,12,18,.9));box-shadow:var(--shadow);position:relative;overflow:hidden}.restaurant-hero:after{content:'';position:absolute;width:370px;height:370px;right:-160px;top:-170px;background:radial-gradient(circle,rgba(126,140,255,.18),transparent 65%);pointer-events:none}.hero-copy h1{font:700 clamp(38px,6vw,76px) var(--display);letter-spacing:-.065em;line-height:.93;margin:8px 0}.hero-location{font-size:11px;color:#7e8b9f;margin:0;max-width:800px}.hero-actions{display:flex;gap:8px;margin-top:20px;flex-wrap:wrap}.ghost-btn{border-color:var(--line);color:#acb5c4;background:#0e141f}.hero-score{min-width:190px;align-self:center;text-align:right;position:relative;z-index:1}.hero-score span,.hero-score small{display:block;color:#626e82;font:700 8px var(--display);letter-spacing:.15em}.hero-score strong{display:block;font:700 86px var(--display);letter-spacing:-.08em;line-height:.86;background:linear-gradient(135deg,#fff,#8390ff 70%,#63e8ff);-webkit-background-clip:text;background-clip:text;color:transparent}.hero-score em{display:inline-block;font-style:normal;color:#d0d6ff;background:rgba(126,140,255,.08);border:1px solid rgba(126,140,255,.17);padding:7px 10px;border-radius:999px;font:700 8px var(--display);margin-top:9px}.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin:9px 0}.intel-stat{background:#0c121c;border:1px solid var(--line);border-radius:17px;padding:17px;position:relative;overflow:hidden}.intel-stat:after{content:'';position:absolute;width:100px;height:100px;right:-55px;bottom:-55px;background:radial-gradient(circle,rgba(126,140,255,.12),transparent 66%)}.intel-stat span,.intel-stat em{display:block;color:#5f6c80;font:700 8px var(--display);letter-spacing:.1em;font-style:normal}.intel-stat strong{display:block;font:700 24px var(--display);margin:8px 0;color:#edf1f6}.intel-stat strong small{color:#ffc47c}.intel-stat em{font-size:8px;letter-spacing:0}.intel-grid{display:grid;grid-template-columns:2fr 1fr;gap:9px;margin-top:9px}.feature-card,.recommend-card,.menu-section,.deal-bar{border:1px solid var(--line);border-radius:21px;background:linear-gradient(145deg,#101621,#0b1018);padding:23px;position:relative;overflow:hidden}.feature-card:before,.recommend-card:before{content:'';position:absolute;inset:0;background:linear-gradient(115deg,rgba(126,140,255,.06),transparent 35%);pointer-events:none}.feature-wide{grid-row:span 2}.card-kicker{font:700 8px var(--display);color:#627089;letter-spacing:.16em}.feature-card h2,.recommend-card h2,.menu-section h2,.deal-bar h2{font:600 25px var(--display);letter-spacing:-.045em;margin:7px 0 10px}.feature-card p,.recommend-card li,.deal-bar p{color:#808ca0;font-size:10px;line-height:1.75}.lead{font-size:14px!important;color:#bac3d0!important;max-width:760px}.tag-row span{font-size:8px;color:#9ba5ff;background:#12182a;border:1px solid rgba(126,140,255,.14);padding:5px 7px;border-radius:7px}.signal{margin-top:15px;display:inline-block;font:700 8px var(--display);color:#ffc27c;background:rgba(255,179,106,.07);padding:7px 9px;border-radius:8px}.signal.good{color:#7ce7c1;background:rgba(125,255,202,.06)}.menu-section{margin-top:9px}.section-head{display:flex;align-items:end;justify-content:space-between;margin-bottom:13px}.section-head span{font-size:8px;color:#596579}.menu-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.menu-item{display:flex;align-items:center;justify-content:space-between;padding:12px;border:1px solid rgba(255,255,255,.07);background:#0c131d;border-radius:12px;transition:.25s}.menu-item:hover{transform:translateY(-2px);border-color:rgba(126,140,255,.25)}.menu-item span{display:block;color:#566278;font:700 7px var(--display);letter-spacing:.1em}.menu-item strong{display:block;color:#d7dfea;font-size:10px;margin-top:3px}.menu-item>b{color:#78efbd;font:700 10px var(--display)}.recommend-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:9px}.recommend-card ul{padding-left:17px;margin:0}.try{border-color:rgba(125,255,202,.15)}.skip{border-color:rgba(255,113,136,.13)}.flags{border-color:rgba(255,179,106,.13)}.deal-bar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-top:9px}.deal-actions{display:flex;gap:7px;flex-wrap:wrap}.deal{color:#fff}.swiggy{background:#ef6d00}.zomato{background:#d92747}.whatsapp{background:#159b70}
+.spinner-dot{display:inline-block;width:9px;height:9px;border:2px solid rgba(8,12,18,.25);border-top-color:#07111a;border-radius:50%;animation:spin .8s linear infinite}.is-loading .list-heading b{opacity:.55}.is-loading .list-heading b:after{content:' •';animation:blink .8s infinite}
+@keyframes blink{0%,100%{opacity:.35}50%{opacity:1}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes shimmer{to{transform:translateX(180px)}}@keyframes scan{0%{transform:translateY(0);opacity:0}10%{opacity:1}50%{opacity:.45}90%{opacity:1}100%{transform:translateY:82vh;opacity:0}}@keyframes radar{0%{transform:scale(.8);opacity:.75}100%{transform:scale(3.2);opacity:0}}@keyframes pinPulse{0%{transform:scale(.65);opacity:.6}70%,100%{transform:scale(1.7);opacity:0}}@keyframes clusterFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
+@media(max-width:900px){body{overflow:auto}.topbar{height:58px}.app-shell{height:calc(100vh - 58px)}.sidebar{width:365px;min-width:365px}.map-legend,.map-bottom-note{display:none}.restaurant-hero{flex-direction:column}.hero-score{text-align:left}.stat-grid{grid-template-columns:1fr 1fr}.recommend-grid{grid-template-columns:1fr}.intel-grid{grid-template-columns:1fr}.feature-wide{grid-row:auto}.menu-grid{grid-template-columns:1fr}}@media(max-width:700px){.topbar-right .meta-copy,.topbar-right .live-pill{display:none}.sidebar{position:absolute;height:100%;width:min(92vw,390px);min-width:min(92vw,390px)}.sidebar.collapsed{width:0;min-width:0}.map-overlay-top{left:9px;right:9px}.map-hint{display:none}.restaurant-page{padding:20px 13px 48px}.restaurant-hero{padding:22px;border-radius:20px}.hero-score strong{font-size:58px}.stat-grid{gap:6px}.intel-stat{padding:13px}.intel-stat strong{font-size:18px}.feature-card,.recommend-card,.menu-section,.deal-bar{padding:17px;border-radius:16px}.deal-bar{align-items:flex-start;flex-direction:column}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}.cursor-glow,.map-scanline{display:none}}
+
 
 ==================================================
 FILE: ./static/js/filters.js
 ==================================================
 
-// Load cuisines and vibes from API
-async function loadFilterOptions() {
-    try {
-        const [cuisineRes, vibeRes] = await Promise.all([
-            fetch('/api/cuisines'),
-            fetch('/api/vibes')
-        ]);
-        const cuisines = await cuisineRes.json();
-        const vibes = await vibeRes.json();
-        
-        const cuisineSelect = document.getElementById('cuisine-filter');
-        cuisineSelect.innerHTML = cuisines.cuisines.map(c => `<option value="${c}">${c}</option>`).join('');
-        
-        const vibeSelect = document.getElementById('vibe-filter');
-        vibeSelect.innerHTML = vibes.vibes.map(v => `<option value="${v}">${v}</option>`).join('');
-    } catch (e) {
-        console.warn('Could not load dynamic filter options', e);
-    }
-}
+async function loadFilterOptions(){try{const [cRes,vRes]=await Promise.all([fetch('/api/cuisines'),fetch('/api/vibes')]);const cuisines=await cRes.json(),vibes=await vRes.json();const c=document.getElementById('cuisine-filter'),v=document.getElementById('vibe-filter');c.innerHTML=(cuisines.cuisines||[]).map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');v.innerHTML=(vibes.vibes||[]).map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('')}catch(e){console.warn('Filter options unavailable',e)}}
+function escapeHtml(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+function selected(id){return Array.from(document.getElementById(id)?.selectedOptions||[]).map(o=>o.value)}
+function getFilters(){const f={q:document.getElementById('search-input').value.trim(),locality:document.getElementById('locality-filter').value,cuisine:selected('cuisine-filter').join(','),open_now:document.getElementById('open-now-filter').checked,late_night:document.getElementById('late-night-filter').checked,pure_veg:document.getElementById('pure-veg-filter').checked,exclude_avoid_veg:document.getElementById('exclude-avoid-veg').checked,exclude_avoid_nonveg:document.getElementById('exclude-avoid-nonveg').checked,hype:document.getElementById('hype-filter').value,fake_risk:document.getElementById('fake-risk-filter').value,dietary:document.getElementById('dietary-filter').value,low_fake_risk:document.getElementById('low-fake-risk').checked,vibe:selected('vibe-filter').join(','),sort:document.getElementById('sort-select').value};if(Number.isFinite(window.userLat)&&Number.isFinite(window.userLon)&&window.selectedRadius){f.lat=window.userLat;f.lon=window.userLon;f.radius_km=window.selectedRadius}return f}
+function countActiveFilters(f){return ['q','locality','cuisine','open_now','late_night','pure_veg','exclude_avoid_veg','exclude_avoid_nonveg','hype','fake_risk','dietary','low_fake_risk','vibe'].reduce((n,k)=>n+(f[k]?(typeof f[k]==='boolean'?1:1):0),0)+(f.lat&&f.radius_km?1:0)}
+window.getFilters=getFilters;window.countActiveFilters=countActiveFilters;window.loadFilterOptions=loadFilterOptions;document.addEventListener('DOMContentLoaded',loadFilterOptions);
 
-// Get all filter values (fixed: only include lat/lon/radius if valid)
-function getFilters() {
-    const cuisineSelect = document.getElementById('cuisine-filter');
-    const selectedCuisines = Array.from(cuisineSelect.selectedOptions).map(opt => opt.value);
-    const vibeSelect = document.getElementById('vibe-filter');
-    const selectedVibes = Array.from(vibeSelect.selectedOptions).map(opt => opt.value);
-    
-    const filterObj = {
-        q: document.getElementById('search-input').value.trim(),
-        locality: document.getElementById('locality-filter').value,
-        cuisine: selectedCuisines.join(','),
-        open_now: document.getElementById('open-now-filter').checked,
-        late_night: document.getElementById('late-night-filter').checked,
-        pure_veg: document.getElementById('pure-veg-filter').checked,
-        exclude_avoid_veg: document.getElementById('exclude-avoid-veg').checked,
-        exclude_avoid_nonveg: document.getElementById('exclude-avoid-nonveg').checked,
-        hype: document.getElementById('hype-filter').value,
-        fake_risk: document.getElementById('fake-risk-filter').value,
-        dietary: document.getElementById('dietary-filter').value,
-        vibe: selectedVibes.join(','),
-        sort: document.getElementById('sort-select').value,
-    };
-
-    // Only add location if we have valid numbers
-    if (window.userLat && window.userLon && window.selectedRadius) {
-        filterObj.lat = window.userLat;
-        filterObj.lon = window.userLon;
-        filterObj.radius_km = window.selectedRadius;
-    }
-    return filterObj;
-}
-
-// Count active filters
-function countActiveFilters(filters) {
-    let count = 0;
-    if (filters.q) count++;
-    if (filters.locality) count++;
-    if (filters.cuisine) count++;
-    if (filters.open_now) count++;
-    if (filters.late_night) count++;
-    if (filters.pure_veg) count++;
-    if (filters.exclude_avoid_veg) count++;
-    if (filters.exclude_avoid_nonveg) count++;
-    if (filters.hype) count++;
-    if (filters.fake_risk) count++;
-    if (filters.dietary) count++;
-    if (filters.vibe) count++;
-    if (filters.lat && filters.radius_km) count++;
-    return count;
-}
-
-// Expose functions globally
-window.getFilters = getFilters;
-window.countActiveFilters = countActiveFilters;
-window.loadFilterOptions = loadFilterOptions;
-
-// Load options on page load
-document.addEventListener('DOMContentLoaded', loadFilterOptions);
 
 ==================================================
 FILE: ./static/js/map.js
@@ -2652,265 +2970,209 @@ FILE: ./static/js/map.js
 let map;
 let markersGroup;
 let userMarker = null;
+let pollInterval = null;
+let fetchController = null;
+let lastRestaurants = [];
+
+const $ = id => document.getElementById(id);
+const safe = v => String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+
+const VERDICT = {
+  'Hidden Gem': 'gem',
+  'Justified Hype': 'hype',
+  'Reliable Classic': 'classic',
+  'Overhyped': 'overhyped'
+};
 
 document.addEventListener('DOMContentLoaded', () => {
-    initMap();
-    initEventListeners();
-    fetchRestaurants();
+  initMap();
+  initEventListeners();
+  animateEntrance();
+  fetchRestaurants();
 });
 
-function initMap() {
-    map = L.map('map', { zoomControl: false }).setView([17.4065, 78.4772], 12);
-    L.control.zoom({ position: 'bottomright' }).addTo(map);
-
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors',
-        maxZoom: 19
-    }).addTo(map);
-
-    markersGroup = L.markerClusterGroup({
-        chunkedLoading: true,
-        showCoverageOnHover: false
-    });
-    map.addLayer(markersGroup);
+function animateEntrance(){
+  if(!window.anime) return;
+  anime.animate('.sidebar-head,.search-panel,.filter-card,.location-card,.pipeline-card,.list-heading',{opacity:[0,1],x:[-18,0],duration:900,delay:anime.stagger(75),ease:'out(4)'});
 }
 
-function initEventListeners() {
-    const triggerFetch = () => {
-        updateActiveFilterBadge();
-        fetchRestaurants();
-    };
+function initMap(){
+  map = L.map('map', {
+    zoomControl:false,
+    preferCanvas:true,
+    zoomSnap:0.25,
+    zoomDelta:0.5,
+    wheelDebounceTime:30,
+    wheelPxPerZoomLevel:100
+  }).setView([17.4065, 78.4772], 12);
 
-    let debounceTimer;
-    document.getElementById('search-input').addEventListener('input', () => {
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(triggerFetch, 300);
-    });
+  L.control.zoom({position:'bottomright'}).addTo(map);
 
-    [
-        'locality-filter', 'sort-select', 'cuisine-filter', 'dietary-filter',
-        'fake-risk-filter', 'hype-filter', 'vibe-filter', 'open-now-filter',
-        'late-night-filter', 'pure-veg-filter', 'exclude-avoid-veg', 'exclude-avoid-nonveg'
-    ].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) {
-            el.addEventListener('change', triggerFetch);
-            el.addEventListener('input', triggerFetch);
-        }
-    });
+  const tiles = L.tileLayer('https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}{r}.png', {
+    maxZoom:20,
+    attribution:'&copy; Stadia Maps &copy; OpenMapTiles &copy; OpenStreetMap contributors',
+    subdomains:'abcd'
+  }).addTo(map);
 
-    // GPS
-    const gpsBtn = document.getElementById('gps-btn');
-    const distChipsContainer = document.getElementById('distance-chips');
-    gpsBtn.addEventListener('click', () => {
-        if (!navigator.geolocation) {
-            alert('Geolocation is not supported.');
-            return;
-        }
-        gpsBtn.textContent = '📍 Locating…';
-        navigator.geolocation.getCurrentPosition(
-            (pos) => {
-                window.userLat = pos.coords.latitude;
-                window.userLon = pos.coords.longitude;
-                window.selectedRadius = window.selectedRadius || 5;
-
-                gpsBtn.textContent = '📍 Location Active';
-                gpsBtn.classList.replace('bg-emerald-600', 'bg-emerald-800');
-                distChipsContainer.classList.remove('hidden');
-
-                if (userMarker) map.removeLayer(userMarker);
-                userMarker = L.circleMarker([window.userLat, window.userLon], {
-                    radius: 8,
-                    fillColor: '#2563eb',
-                    color: '#ffffff',
-                    weight: 2,
-                    fillOpacity: 0.9
-                }).addTo(map).bindPopup('You are here').openPopup();
-
-                map.setView([window.userLat, window.userLon], 13);
-                triggerFetch();
-            },
-            (err) => {
-                alert(`Geolocation error: ${err.message}`);
-                gpsBtn.textContent = '📍 Use My Location';
-            }
-        );
-    });
-
-    // Distance chips
-    document.querySelectorAll('.dist-chip').forEach(chip => {
-        chip.addEventListener('click', (e) => {
-            document.querySelectorAll('.dist-chip').forEach(c => c.classList.remove('bg-slate-800', 'text-white'));
-            e.target.classList.add('bg-slate-800', 'text-white');
-            window.selectedRadius = parseFloat(e.target.dataset.km);
-            triggerFetch();
-        });
-    });
-
-    // Reset filters
-    document.getElementById('reset-filters').addEventListener('click', () => {
-        document.getElementById('search-input').value = '';
-        document.getElementById('locality-filter').value = '';
-        document.getElementById('sort-select').value = 'reviews';
-        document.getElementById('cuisine-filter').selectedIndex = -1;
-        document.getElementById('dietary-filter').value = '';
-        document.getElementById('fake-risk-filter').value = '';
-        document.getElementById('hype-filter').value = '';
-        document.getElementById('vibe-filter').selectedIndex = -1;
-
-        ['open-now-filter', 'late-night-filter', 'pure-veg-filter', 'exclude-avoid-veg', 'exclude-avoid-nonveg'].forEach(id => {
-            document.getElementById(id).checked = false;
-        });
-
-        window.userLat = null;
-        window.userLon = null;
-        window.selectedRadius = null;
-        if (userMarker) { map.removeLayer(userMarker); userMarker = null; }
-        gpsBtn.textContent = '📍 Use My Location';
-        gpsBtn.classList.replace('bg-emerald-800', 'bg-emerald-600');
-        distChipsContainer.classList.add('hidden');
-
-        triggerFetch();
-    });
-
-    // Sidebar collapse/expand
-    const sidebar = document.getElementById('sidebar');
-    const collapseBtn = document.getElementById('collapse-btn');
-    const expandBtn = document.getElementById('expand-btn');
-
-    collapseBtn.addEventListener('click', () => {
-        sidebar.classList.add('-translate-x-full');
-        sidebar.style.display = 'none';
-        expandBtn.classList.remove('hidden');
-    });
-
-    expandBtn.addEventListener('click', () => {
-        sidebar.style.display = 'flex';
-        sidebar.classList.remove('-translate-x-full');
-        expandBtn.classList.add('hidden');
-    });
-
-    // Pipeline trigger
-    const pipelineBtn = document.getElementById('pipeline-btn');
-    const pipelineStatus = document.getElementById('pipeline-status');
-
-    pipelineBtn.addEventListener('click', async () => {
-        pipelineBtn.disabled = true;
-        pipelineBtn.textContent = 'Starting…';
-        pipelineStatus.classList.remove('hidden');
-        pipelineStatus.textContent = 'Initializing pipeline…';
-
-        try {
-            const res = await fetch('/api/pipeline/run?max_targets=5&skip_scrape=false', { method: 'POST' });
-            if (!res.ok) throw new Error((await res.json()).message || 'Failed to trigger');
-
-            const poller = setInterval(async () => {
-                const sRes = await fetch('/api/pipeline/status');
-                const state = await sRes.json();
-                pipelineStatus.textContent = `Stage: ${state.stage || 'running…'}`;
-
-                if (!state.running) {
-                    clearInterval(poller);
-                    pipelineBtn.disabled = false;
-                    pipelineBtn.textContent = 'Run Pipeline';
-                    pipelineStatus.textContent = `Completed: ${state.stage}`;
-                    fetchRestaurants();
-                    setTimeout(() => pipelineStatus.classList.add('hidden'), 4000);
-                }
-            }, 1500);
-        } catch (e) {
-            pipelineStatus.textContent = `Error: ${e.message}`;
-            pipelineBtn.disabled = false;
-            pipelineBtn.textContent = 'Run Pipeline';
-        }
-    });
-}
-
-function updateActiveFilterBadge() {
-    const filters = getFilters();
-    const count = countActiveFilters(filters);
-    const badge = document.getElementById('active-filter-count');
-    if (count > 0) {
-        badge.textContent = count;
-        badge.classList.remove('hidden');
-    } else {
-        badge.classList.add('hidden');
+  tiles.on('tileerror', () => {
+    if(!map._fallbackTiles){
+      map._fallbackTiles = true;
+      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        maxZoom:20,
+        attribution:'&copy; OpenStreetMap contributors &copy; CARTO',
+        subdomains:'abcd'
+      }).addTo(map);
     }
-}
+  });
 
-async function fetchRestaurants() {
-    const params = new URLSearchParams(getFilters());
-    try {
-        const res = await fetch(`/api/restaurants?${params.toString()}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        updateUI(data.restaurants || []);
-    } catch (e) {
-        console.error('Failed to fetch restaurants:', e);
+  markersGroup = L.markerClusterGroup({
+    chunkedLoading:true,
+    showCoverageOnHover:false,
+    spiderfyOnMaxZoom:true,
+    removeOutsideVisibleBounds:true,
+    maxClusterRadius:52,
+    iconCreateFunction(cluster){
+      const count=cluster.getChildCount();
+      const size=count>99?'xl':count>9?'lg':'md';
+      return L.divIcon({className:'food-cluster-wrap',html:`<div class="food-cluster ${size}"><span>${count}</span><i></i></div>`,iconSize:null});
     }
+  });
+  map.addLayer(markersGroup);
+
+  map.on('moveend',()=>{
+    const c=map.getCenter();
+    $('map-status-text').textContent=`${c.lat.toFixed(2)}°, ${c.lng.toFixed(2)}° · ${map.getZoom().toFixed(1)}×`;
+  });
+
+  map.on('zoomstart',()=>document.body.classList.add('is-map-moving'));
+  map.on('zoomend moveend',()=>document.body.classList.remove('is-map-moving'));
 }
 
-function updateUI(restaurants) {
-    const listEl = document.getElementById('restaurant-list');
-    const emptyEl = document.getElementById('empty-state');
-    const countBadge = document.getElementById('count-badge');
+function initEventListeners(){
+  const triggerFetch=()=>{updateActiveFilterBadge();fetchRestaurants()};
+  let debounceTimer;
+  $('search-input').addEventListener('input',()=>{clearTimeout(debounceTimer);debounceTimer=setTimeout(triggerFetch,280)});
+  ['locality-filter','sort-select','cuisine-filter','dietary-filter','fake-risk-filter','hype-filter','vibe-filter','open-now-filter','late-night-filter','pure-veg-filter','exclude-avoid-veg','exclude-avoid-nonveg','low-fake-risk']
+    .forEach(id=>{const el=$(id);if(el){el.addEventListener('change',triggerFetch);el.addEventListener('input',triggerFetch)}});
 
-    countBadge.textContent = `${restaurants.length} place${restaurants.length === 1 ? '' : 's'} found`;
-    listEl.innerHTML = '';
-    markersGroup.clearLayers();
-
-    if (restaurants.length === 0) {
-        emptyEl.classList.remove('hidden');
-        return;
+  document.querySelectorAll('.quick-chip').forEach(btn=>btn.addEventListener('click',()=>{
+    const already=btn.classList.contains('active');
+    document.querySelectorAll('.quick-chip').forEach(x=>x.classList.remove('active'));
+    if(already){
+      $('open-now-filter').checked=false;$('pure-veg-filter').checked=false;$('hype-filter').value='';
+    }else{
+      btn.classList.add('active');
+      const q=btn.dataset.quick;
+      if(q==='open'){$('open-now-filter').checked=true;$('pure-veg-filter').checked=false;$('hype-filter').value=''}
+      if(q==='veg'){$('pure-veg-filter').checked=true;$('open-now-filter').checked=false;$('hype-filter').value=''}
+      if(q==='gem'){$('hype-filter').value='Hidden Gem';$('open-now-filter').checked=false;$('pure-veg-filter').checked=false}
     }
-    emptyEl.classList.add('hidden');
+    triggerFetch(); pulse(btn);
+  }));
 
-    restaurants.forEach(r => {
-        const ai = r.ai_analysis || {};
-        
-        // List card
-        const li = document.createElement('li');
-        li.className = 'p-3 bg-white border border-slate-200 rounded-xl hover:border-blue-400 hover:shadow transition cursor-pointer';
-        li.innerHTML = `
-            <div class="flex justify-between items-start">
-                <h3 class="font-bold text-sm text-slate-800">${r.name}</h3>
-                <span class="text-xs font-semibold px-2 py-0.5 bg-blue-50 text-blue-700 rounded-full">${r.rating || 'N/A'} ★</span>
-            </div>
-            <p class="text-xs text-slate-500 mt-0.5">${r.locality || 'Hyderabad'} · ${(r.review_count || 0).toLocaleString()} reviews</p>
-            <div class="flex flex-wrap gap-1 mt-2">
-                ${ai.hype_verdict ? `<span class="text-[10px] px-1.5 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded">${ai.hype_verdict}</span>` : ''}
-                ${ai.is_pure_veg ? `<span class="text-[10px] px-1.5 py-0.5 bg-green-50 text-green-700 border border-green-200 rounded">Pure Veg</span>` : ''}
-                ${ai.calculated_spend_for_two ? `<span class="text-[10px] px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded">₹${ai.calculated_spend_for_two} for 2</span>` : ''}
-            </div>
-            <div class="mt-2 flex justify-between items-center pt-2 border-t border-slate-100">
-                <a href="/restaurant/${r.slug}" class="text-xs text-blue-600 font-medium hover:underline">View AI Intel →</a>
-                ${r.google_maps_url ? `<a href="${r.google_maps_url}" target="_blank" class="text-xs text-slate-400 hover:text-slate-600">Maps ↗</a>` : ''}
-            </div>
-        `;
+  $('gps-btn').addEventListener('click',useLocation);
+  document.querySelectorAll('.dist-chip').forEach(chip=>chip.addEventListener('click',()=>{
+    document.querySelectorAll('.dist-chip').forEach(c=>c.classList.remove('active'));
+    chip.classList.add('active');window.selectedRadius=+chip.dataset.km;triggerFetch();pulse(chip)
+  }));
 
-        li.addEventListener('click', (e) => {
-            if (e.target.tagName !== 'A' && r.latitude && r.longitude) {
-                map.setView([r.latitude, r.longitude], 16);
-            }
-        });
+  $('reset-filters').addEventListener('click',()=>{resetFilters();pulse($('reset-filters'))});
 
-        listEl.appendChild(li);
+  $('collapse-btn').addEventListener('click',()=>{
+    $('sidebar').classList.add('collapsed');$('expand-btn').classList.remove('hidden');setTimeout(()=>map.invalidateSize(),450);
+  });
+  $('expand-btn').addEventListener('click',()=>{
+    $('sidebar').classList.remove('collapsed');$('expand-btn').classList.add('hidden');setTimeout(()=>map.invalidateSize(),450);
+  });
 
-        // Map marker
-        if (r.latitude && r.longitude) {
-            const marker = L.marker([r.latitude, r.longitude]);
-            marker.bindPopup(`
-                <div class="p-1">
-                    <h4 class="font-bold text-sm">${r.name}</h4>
-                    <p class="text-xs text-slate-600">${r.rating || 'N/A'} ★ (${(r.review_count || 0).toLocaleString()} reviews)</p>
-                    <p class="text-xs text-slate-500 mt-1">${r.address || r.locality || ''}</p>
-                    <a href="/restaurant/${r.slug}" class="inline-block mt-2 text-xs text-blue-600 font-semibold hover:underline">Full Analysis & Menu →</a>
-                </div>
-            `);
-            markersGroup.addLayer(marker);
-        }
-    });
+  $('pipeline-btn').addEventListener('click',runPipeline);
+  document.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();$('search-input').focus();pulse($('search-input'))}});
+
+  document.querySelectorAll('.magnetic').forEach(el=>{
+    if(!matchMedia('(pointer:fine)').matches)return;
+    el.addEventListener('pointermove',e=>{const r=el.getBoundingClientRect();el.style.transform=`translate(${(e.clientX-r.left-r.width/2)*.08}px,${(e.clientY-r.top-r.height/2)*.08}px)`});
+    el.addEventListener('pointerleave',()=>el.style.transform='');
+  });
 }
+
+function pulse(el){
+  if(!window.anime || !el) return;
+  anime.animate(el,{scale:[1,1.045,1],duration:420,ease:'out(4)'});
+}
+
+function useLocation(){
+  if(!navigator.geolocation){alert('Geolocation is not supported.');return}
+  const b=$('gps-btn');b.disabled=true;b.innerHTML='Locating <span class="spinner-dot"></span>';
+  navigator.geolocation.getCurrentPosition(pos=>{
+    window.userLat=pos.coords.latitude;window.userLon=pos.coords.longitude;window.selectedRadius=window.selectedRadius||5;
+    b.disabled=false;b.innerHTML='Location active <span>✓</span>';b.classList.add('location-live');$('distance-chips').classList.remove('hidden');
+    if(userMarker) map.removeLayer(userMarker);
+    userMarker=L.circleMarker([window.userLat,window.userLon],{radius:8,fillColor:'#7dffca',color:'#0b0f18',weight:4,fillOpacity:1}).addTo(map);
+    userMarker.bindPopup('<div class="user-popup"><b>You are here</b><span>Distance mode enabled</span></div>').openPopup();
+    map.flyTo([window.userLat,window.userLon],14,{duration:1.4,easeLinearity:.2});fetchRestaurants();
+  },err=>{b.disabled=false;b.innerHTML='Use my location <span>→</span>';alert(`Location error: ${err.message}`)});
+}
+
+function resetFilters(){
+  ['search-input','locality-filter'].forEach(id=>$(id).value='');$('sort-select').value='reviews';['cuisine-filter','vibe-filter'].forEach(id=>$(id).selectedIndex=-1);['dietary-filter','fake-risk-filter','hype-filter'].forEach(id=>$(id).value='');
+  ['open-now-filter','late-night-filter','pure-veg-filter','exclude-avoid-veg','exclude-avoid-nonveg','low-fake-risk'].forEach(id=>$(id).checked=false);
+  window.userLat=window.userLon=window.selectedRadius=null;if(userMarker){map.removeLayer(userMarker);userMarker=null}$('distance-chips').classList.add('hidden');$('gps-btn').classList.remove('location-live');$('gps-btn').innerHTML='Use my location <span>→</span>';document.querySelectorAll('.quick-chip').forEach(x=>x.classList.remove('active'));updateActiveFilterBadge();fetchRestaurants();
+}
+
+function updateActiveFilterBadge(){const n=countActiveFilters(getFilters()),b=$('active-filter-count');b.textContent=n;b.classList.toggle('hidden',!n)}
+
+async function fetchRestaurants(){
+  if(fetchController)fetchController.abort();fetchController=new AbortController();$('count-badge').textContent='Scanning the field…';document.body.classList.add('is-loading');
+  try{const params=new URLSearchParams(getFilters());const res=await fetch(`/api/restaurants?${params}`,{signal:fetchController.signal});if(!res.ok)throw Error(`HTTP ${res.status}`);const data=await res.json();lastRestaurants=data.restaurants||[];updateUI(lastRestaurants)}
+  catch(e){if(e.name!=='AbortError'){$('count-badge').textContent='Could not load';console.error(e)}}
+  finally{document.body.classList.remove('is-loading')}
+}
+
+function makeMarker(r,i){
+  const ai=r.ai_analysis||{};const verdict=VERDICT[ai.hype_verdict]||'classic';const score=ai.hype_score!=null?Math.round(Number(ai.hype_score)):'—';
+  const icon=L.divIcon({className:'food-pin-wrap',html:`<div class="food-pin ${verdict}"><div class="pin-pulse"></div><div class="pin-core"><span>${score}</span></div><label>${safe(r.name)}</label></div>`,iconSize:[32,32],iconAnchor:[16,16],popupAnchor:[0,-12]});
+  const marker=L.marker([r.latitude,r.longitude],{icon, riseOnHover:true});
+  marker.bindPopup(`<div class="popup-card"><div class="popup-kicker">${safe(ai.hype_verdict||'RESTAURANT')}</div><div class="popup-title">${safe(r.name)}</div><div class="popup-meta"><b>${safe(r.rating||'N/A')} ★</b> · ${(r.review_count||0).toLocaleString()} reviews</div><div class="popup-meta">${safe(r.address||r.locality||'')}</div><div class="popup-actions"><a href="/restaurant/${encodeURIComponent(r.slug)}">Full intel ↗</a>${r.google_maps_url?`<a href="${safe(r.google_maps_url)}" target="_blank">Maps ↗</a>`:''}</div></div>`,{maxWidth:280});
+  marker.on('click', () => {
+    document.querySelectorAll('.restaurant-card').forEach(x => x.classList.remove('selected'));
+    const card = document.querySelectorAll('.restaurant-card')[i];
+    if (card) {
+      card.classList.add('selected');
+      card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  });
+  return marker;
+}
+
+function updateUI(restaurants){
+  const list=$('restaurant-list'),empty=$('empty-state');$('count-badge').textContent=`${restaurants.length} ${restaurants.length===1?'place':'places'}`;list.innerHTML='';markersGroup.clearLayers();
+  if(!restaurants.length){empty.classList.remove('hidden');return}empty.classList.add('hidden');
+  const markers=[];
+  restaurants.forEach((r,i)=>{
+    const ai=r.ai_analysis||{},verdict=VERDICT[ai.hype_verdict]||'';const li=document.createElement('li');li.className='restaurant-card';li.dataset.slug=r.slug;
+    li.innerHTML=`<div class="card-index">${String(i+1).padStart(2,'0')}</div><div class="r-top"><div><div class="r-name">${safe(r.name)}</div><div class="r-meta">${safe(r.locality||'Hyderabad')} · ${(r.review_count||0).toLocaleString()} reviews</div></div><span class="rating-pill">${safe(r.rating||'N/A')} ★</span></div><div class="tag-row">${ai.hype_verdict?`<span class="tag ${verdict}">${safe(ai.hype_verdict)}</span>`:''}${ai.is_pure_veg?'<span class="tag gem">PURE VEG</span>':''}${ai.calculated_spend_for_two?`<span class="tag">₹${safe(ai.calculated_spend_for_two)} / 2</span>`:''}${ai.fake_review_risk?`<span class="tag risk">${safe(ai.fake_review_risk)} RISK</span>`:''}</div><div class="r-bottom"><a class="r-link" href="/restaurant/${encodeURIComponent(r.slug)}">Open field note ↗</a>${r.google_maps_url?`<a class="maps-link" href="${safe(r.google_maps_url)}" target="_blank">Maps ↗</a>`:''}</div>`;
+    li.addEventListener('click',e=>{if(e.target.closest('a'))return;document.querySelectorAll('.restaurant-card').forEach(x=>x.classList.remove('selected'));li.classList.add('selected');pulse(li);if(r.latitude&&r.longitude)map.flyTo([r.latitude,r.longitude],16,{duration:.9,easeLinearity:.2})});
+    list.appendChild(li);
+    if(r.latitude&&r.longitude)markers.push(makeMarker(r,i));
+  });
+  markersGroup.addLayers(markers);
+  if(window.anime){anime.animate('.restaurant-card',{opacity:[0,1],x:[-18,0],delay:anime.stagger(38),duration:640,ease:'out(4)'});anime.animate('.food-pin',{scale:[0,1],opacity:[0,1],delay:anime.stagger(20),duration:700,ease:'out(4)'})}
+}
+
+async function runPipeline(){
+  const b=$('pipeline-btn'),s=$('pipeline-status'),text=$('pipeline-progress-text'),bar=$('pipeline-progress-bar'),pct=$('pipeline-percent');b.disabled=true;b.classList.add('running');b.querySelector('span').textContent='Engine running';s.classList.remove('hidden');text.textContent='Initializing pipeline…';bar.style.width='0%';pct.textContent='0%';
+  try{
+    const res=await fetch('/api/pipeline/run?max_targets=5&skip_scrape=false',{method:'POST'});if(!res.ok)throw Error((await res.json()).message||'Failed to trigger');
+    if(pollInterval)clearInterval(pollInterval);
+    pollInterval=setInterval(async()=>{
+      const r=await fetch('/api/pipeline/status');const state=await r.json();let stageText=state.stage||'running…',detail='';
+      if(state.progress&&typeof state.progress==='object'){if(state.progress.message)detail=state.progress.message;else if(state.progress.current&&state.progress.total)detail=`${state.progress.current}/${state.progress.total}`}
+      text.textContent=`${stageText}${detail?' · '+detail:''}`;let percent=0;if(state.progress&&state.progress.current&&state.progress.total)percent=Math.min(100,Math.round((state.progress.current/state.progress.total)*100));bar.style.width=`${percent}%`;pct.textContent=`${percent}%`;
+      if(!state.running){clearInterval(pollInterval);pollInterval=null;b.disabled=false;b.classList.remove('running');b.querySelector('span').textContent='Run pipeline';bar.style.width='100%';pct.textContent='100%';text.textContent=`Completed · ${state.stage||'done'}`;fetchRestaurants();pulse(b);setTimeout(()=>{s.classList.add('hidden');bar.style.width='0%';pct.textContent='0%'},5000)}
+    },1000);
+  }catch(e){text.textContent=`Error · ${e.message}`;b.disabled=false;b.classList.remove('running');b.querySelector('span').textContent='Try again'}
+}
+
 
 ==================================================
 FILE: ./templates/base.html
@@ -2921,26 +3183,52 @@ FILE: ./templates/base.html
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#07080d">
+  <meta name="color-scheme" content="dark">
   <title>{% block title %}HY Food Intel{% endblock %}</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/animejs@4.5.0/lib/anime.iife.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
   <link rel="stylesheet" href="/static/css/style.css">
   {% block head %}{% endblock %}
 </head>
-<body class="bg-slate-50 text-slate-800">
-  <nav class="bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between shadow-sm">
-    <a href="/" class="flex items-center gap-2 font-bold text-lg text-blue-700">
-      <span>🍽️</span> HY Food Intel
+<body>
+  <div class="grain"></div>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+  <div class="cursor-glow" id="cursor-glow"></div>
+  <nav class="topbar">
+    <a href="/" class="brand magnetic" aria-label="HY Food Intel home">
+      <span class="brand-mark"><span>H</span><span>Y</span></span>
+      <span class="brand-word"><strong>Food Intel</strong><small>Hyderabad · culinary intelligence</small></span>
     </a>
-    <div class="flex items-center gap-3 text-sm">
-      <span class="hidden sm:inline text-slate-500">Telangana · ORR · Offline AI</span>
-      <a href="/api/export-csv" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-lg font-medium">Export CSV</a>
+    <div class="topbar-right">
+      <span class="live-pill"><i></i> LIVE SIGNALS</span>
+      <span class="hidden sm:inline meta-copy">AI enriched · map intelligence</span>
+      <a href="/api/export-csv" class="top-action">Export <span>↗</span></a>
     </div>
   </nav>
   {% block content %}{% endblock %}
   {% block scripts %}{% endblock %}
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const glow = document.getElementById('cursor-glow');
+      if (glow && matchMedia('(pointer:fine)').matches) {
+        let tx=0, ty=0, x=0, y=0;
+        window.addEventListener('pointermove', e => { tx=e.clientX; ty=e.clientY; });
+        const loop=()=>{ x += (tx-x)*.12; y += (ty-y)*.12; glow.style.transform=`translate3d(${x}px,${y}px,0)`; requestAnimationFrame(loop); };
+        requestAnimationFrame(loop);
+      }
+      if (window.anime) {
+        anime.animate('.brand,.topbar-right',{opacity:[0,1],y:[-10,0],duration:800,ease:'out(4)'});
+      }
+    });
+  </script>
 </body>
 </html>
 
@@ -2950,170 +3238,94 @@ FILE: ./templates/index.html
 ==================================================
 
 {% extends "base.html" %}
-{% block title %}HY Food Intel — Telangana Restaurant Map{% endblock %}
-
+{% block title %}HY Food Intel — Hyderabad Restaurant Intelligence{% endblock %}
 {% block content %}
-<div id="app" class="flex h-[calc(100vh-57px)] overflow-hidden">
-  <!-- Filter Sidebar -->
-  <aside id="sidebar" class="w-[420px] min-w-[320px] bg-white border-r border-slate-200 flex flex-col transition-all duration-200 z-20 shadow-lg">
-    <div class="p-4 border-b border-slate-100">
-      <div class="flex items-center justify-between mb-1">
-        <h1 class="text-lg font-bold">Restaurant Explorer</h1>
-        <button id="collapse-btn" class="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50" title="Collapse">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
-        </button>
-      </div>
-      <p class="text-xs text-slate-500">4.0+ ★ · 1K+ reviews · AI-enriched</p>
-      <div id="count-badge" class="mt-2 inline-block px-3 py-1 bg-blue-50 text-blue-700 text-xs font-semibold rounded-full">Loading…</div>
-    </div>
-
-    <!-- Filter Drawer -->
-    <!-- In the filter drawer -->
-    <div class="space-y-3">
-      <!-- Search -->
-      <div class="relative">
-        <input type="search" id="search-input" placeholder="Search name, dish, cuisine…"
-              class="w-full pl-9 pr-3 py-2 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none">
-        <svg class="absolute left-3 top-2.5 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-      </div>
-
-      <!-- Locality + Sort -->
-      <div class="grid grid-cols-2 gap-2">
-        <div class="relative">
-          <input list="locality-list" id="locality-filter" placeholder="Locality" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
-          <datalist id="locality-list">
-            {% for loc in localities %}
-            <option value="{{ loc }}">
-            {% endfor %}
-          </datalist>
+<div id="app" class="app-shell">
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-scroll">
+      <header class="sidebar-head reveal-block">
+        <div>
+          <div class="eyebrow">FIELD GUIDE / 01</div>
+          <h1>Find the <em>good</em> stuff.</h1>
+          <p>Not another restaurant directory. A living map of Hyderabad's places, signals and hype.</p>
         </div>
-        <select id="sort-select" class="text-xs border border-slate-200 rounded-lg px-2 py-2">
-          <option value="reviews">Most Reviews</option>
-          <option value="rating">Highest Rating</option>
-          <option value="hype">Hype Score</option>
-          <option value="distance">Nearest</option>
-          <option value="name">Name A-Z</option>
-          <option value="spend">Spend (Low→High)</option>
-        </select>
-      </div>
+        <button id="collapse-btn" class="icon-btn magnetic" title="Collapse explorer" aria-label="Collapse explorer">×</button>
+      </header>
 
-      <!-- Cuisine (multi-select) -->
-      <div>
-        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Cuisine</label>
-        <select id="cuisine-filter" multiple size="3" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1">
-          <!-- filled by JS -->
-        </select>
-        <p class="text-[10px] text-slate-400 mt-0.5">Hold Ctrl/Cmd to select multiple</p>
-      </div>
-
-      <!-- Dietary Suitability -->
-      <div>
-        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Dietary Suitability</label>
-        <select id="dietary-filter" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
-          <option value="">All</option>
-          <option value="Pure Veg">Pure Veg</option>
-          <option value="Non-Veg Specialty">Non‑Veg Specialty</option>
-          <option value="Balanced">Balanced</option>
-        </select>
-      </div>
-
-      <!-- Toggles -->
-      <div class="space-y-1">
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
-          <input type="checkbox" id="open-now-filter" class="rounded border-slate-300 text-blue-600">
-          <span>Open Now</span>
-        </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
-          <input type="checkbox" id="late-night-filter" class="rounded border-slate-300 text-indigo-600">
-          <span>Open Late Night</span>
-        </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
-          <input type="checkbox" id="pure-veg-filter" class="rounded border-slate-300 text-green-600">
-          <span>Pure Veg Only</span>
-        </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
-          <input type="checkbox" id="exclude-avoid-veg" class="rounded border-slate-300 text-orange-600">
-          <span>Exclude "Avoid Veg"</span>
-        </label>
-        <label class="flex items-center gap-2 text-sm cursor-pointer">
-          <input type="checkbox" id="exclude-avoid-nonveg" class="rounded border-slate-300 text-orange-600">
-          <span>Exclude "Avoid Non‑Veg"</span>
-        </label>
-      </div>
-
-      <!-- Fake‑review risk -->
-      <div>
-        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Fake‑Review Risk</label>
-        <select id="fake-risk-filter" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
-          <option value="">All</option>
-          <option value="Low">Low</option>
-          <option value="Moderate">Moderate</option>
-          <option value="High">High</option>
-        </select>
-      </div>
-
-      <!-- Hype verdict -->
-      <div>
-        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Hype Verdict</label>
-        <select id="hype-filter" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-2">
-          <option value="">All Verdicts</option>
-          <option value="Hidden Gem">Hidden Gem</option>
-          <option value="Justified Hype">Justified Hype</option>
-          <option value="Reliable Classic">Reliable Classic</option>
-          <option value="Overhyped">Overhyped</option>
-        </select>
-      </div>
-
-      <!-- Vibe (multi-select) -->
-      <div>
-        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Vibe</label>
-        <select id="vibe-filter" multiple size="2" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1">
-          <!-- filled by JS -->
-        </select>
-        <p class="text-[10px] text-slate-400 mt-0.5">Hold Ctrl/Cmd to select multiple</p>
-      </div>
-
-      <!-- GPS -->
-      <div>
-        <button id="gps-btn" class="w-full py-2 text-sm font-medium bg-emerald-600 text-white rounded-xl hover:bg-emerald-700 transition">
-          📍 Use My Location
-        </button>
-        <div id="distance-chips" class="flex flex-wrap gap-1.5 mt-2 hidden">
-          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200" data-km="2">&lt;2 km</button>
-          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200" data-km="5">&lt;5 km</button>
-          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200" data-km="10">&lt;10 km</button>
-          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200 active" data-km="999">All</button>
+      <section class="search-panel reveal-block">
+        <div class="search-wrap">
+          <span class="search-icon">⌕</span>
+          <input type="search" id="search-input" placeholder="Try biryani, Jubilee Hills, hidden gem…" autocomplete="off">
+          <kbd>⌘ K</kbd>
         </div>
-      </div>
+        <div class="quick-row">
+          <button class="quick-chip" data-quick="open"><i></i> Open now</button>
+          <button class="quick-chip" data-quick="veg">✦ Pure veg</button>
+          <button class="quick-chip" data-quick="gem">◆ Hidden gems</button>
+        </div>
+      </section>
 
-      <!-- Actions -->
-      <div class="flex gap-2">
-        <button id="pipeline-btn" class="flex-1 py-2 text-xs font-medium bg-blue-600 text-white rounded-xl hover:bg-blue-700">Run Pipeline</button>
-        <button id="reset-filters" class="px-3 py-2 text-xs border border-slate-200 rounded-xl hover:bg-slate-50">
-          Reset <span id="active-filter-count" class="hidden ml-1 bg-slate-200 text-slate-700 px-1.5 py-0.5 rounded-full text-[10px]">0</span>
-        </button>
-      </div>
-      <div id="pipeline-status" class="hidden text-xs p-2 bg-amber-50 border border-amber-200 rounded-lg"></div>
-    </div>
+      <section class="filter-card reveal-block">
+        <div class="section-title"><span>Shape the hunt</span><button id="reset-filters" class="reset-btn">Reset <b id="active-filter-count" class="hidden">0</b></button></div>
+        <div class="field-grid">
+          <label class="field"><span>Area</span><input list="locality-list" id="locality-filter" placeholder="Any neighbourhood"><datalist id="locality-list">{% for loc in localities %}<option value="{{ loc }}">{% endfor %}</datalist></label>
+          <label class="field"><span>Sort</span><select id="sort-select"><option value="reviews">Most Reviews</option><option value="rating">Highest Rating</option><option value="hype">Hype Score</option><option value="distance">Nearest</option><option value="name">Name A–Z</option><option value="spend">Spend · Low → High</option></select></label>
+        </div>
+        <label class="field"><span>Cuisine</span><select id="cuisine-filter" multiple size="4"></select><small>⌘/Ctrl-click for a stack</small></label>
+        <div class="field-grid">
+          <label class="field"><span>Dietary</span><select id="dietary-filter"><option value="">Everything</option><option value="Pure Veg">Pure Veg</option><option value="Non-Veg Specialty">Non‑Veg Specialty</option><option value="Balanced">Balanced</option></select></label>
+          <label class="field"><span>Verdict</span><select id="hype-filter"><option value="">All verdicts</option><option value="Hidden Gem">Hidden Gem</option><option value="Justified Hype">Justified Hype</option><option value="Reliable Classic">Reliable Classic</option><option value="Overhyped">Overhyped</option></select></label>
+        </div>
+        <div class="field-grid">
+          <label class="field"><span>Review risk</span><select id="fake-risk-filter"><option value="">All risk levels</option><option value="Low">Low</option><option value="Moderate">Moderate</option><option value="High">High</option></select></label>
+          <label class="field"><span>Vibe</span><select id="vibe-filter" multiple size="3"></select></label>
+        </div>
+        <div class="toggle-grid">
+          <label class="toggle"><input type="checkbox" id="open-now-filter"><span><i></i> Open now</span></label>
+          <label class="toggle"><input type="checkbox" id="late-night-filter"><span><i></i> Late night</span></label>
+          <label class="toggle"><input type="checkbox" id="pure-veg-filter"><span><i></i> Pure veg</span></label>
+          <label class="toggle"><input type="checkbox" id="low-fake-risk"><span><i></i> Low review risk</span></label>
+          <label class="toggle"><input type="checkbox" id="exclude-avoid-veg"><span><i></i> Exclude avoid-veg</span></label>
+          <label class="toggle"><input type="checkbox" id="exclude-avoid-nonveg"><span><i></i> Exclude avoid-nonveg</span></label>
+        </div>
+      </section>
 
-    <!-- Restaurant List -->
-    <ul id="restaurant-list" class="flex-1 overflow-y-auto p-2 space-y-1"></ul>
-    <div id="empty-state" class="hidden p-6 text-center text-sm text-slate-500">
-      <p>No restaurants match your filters.</p>
-      <p class="mt-1 text-xs">Run the pipeline to populate data.</p>
+      <section class="location-card reveal-block">
+        <div class="location-orbit"><div class="orbit-ring"></div><span>⌖</span></div>
+        <div class="location-copy"><strong>Hunt around me</strong><small>Let distance shape the shortlist.</small></div>
+        <button id="gps-btn" class="primary-btn magnetic">Use my location <span>→</span></button>
+        <div id="distance-chips" class="distance-row hidden"><button class="dist-chip" data-km="2">&lt; 2 km</button><button class="dist-chip" data-km="5">&lt; 5 km</button><button class="dist-chip" data-km="10">&lt; 10 km</button><button class="dist-chip active" data-km="999">Any distance</button></div>
+      </section>
+
+      <section class="pipeline-card reveal-block">
+        <div class="pipeline-top"><div><div class="eyebrow">DATA ENGINE</div><strong>Refresh the intelligence</strong><small>Scrape → enrich → re-rank.</small></div><div class="pipeline-orb"></div></div>
+        <button id="pipeline-btn" class="pipeline-btn magnetic"><span>Run pipeline</span><b>↗</b></button>
+        <div id="pipeline-status" class="pipeline-status hidden">
+          <div class="pipeline-line"><span id="pipeline-progress-text">Initializing…</span><span class="pipeline-percent" id="pipeline-percent">0%</span></div>
+          <div class="pipeline-track"><div id="pipeline-progress-bar"></div><i></i></div>
+        </div>
+      </section>
+
+      <div class="list-heading reveal-block"><span><b id="count-badge">Loading…</b></span><span class="list-sort-hint">Tap a result to descend</span></div>
+      <ul id="restaurant-list" class="restaurant-list"></ul>
+      <div id="empty-state" class="empty-state hidden"><div>◌</div><strong>Nothing here yet.</strong><p>Pull back one filter and let the map breathe.</p></div>
     </div>
   </aside>
 
-  <!-- Map -->
-  <main class="flex-1 relative">
-    <button id="expand-btn" class="hidden absolute top-4 left-4 z-[1000] p-2 bg-white rounded-lg shadow border border-slate-200">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
-    </button>
-    <div id="map" class="w-full h-full"></div>
+  <main class="map-stage">
+    <button id="expand-btn" class="map-float hidden magnetic" title="Open explorer">›</button>
+    <div class="map-scanline"></div>
+    <div class="map-overlay-top">
+      <div class="map-status"><i></i><span id="map-status-text">Hyderabad · live restaurant field</span></div>
+      <div class="map-hint">DRAG · ZOOM · DISCOVER</div>
+    </div>
+    <div class="map-center-mark"><span></span><i></i></div>
+    <div class="map-canvas" id="map"></div>
+    <div class="map-legend"><span><i class="legend-dot gem"></i> GEMS</span><span><i class="legend-dot hype"></i> HYPE</span><span><i class="legend-dot classic"></i> CLASSICS</span></div>
+    <div class="map-bottom-note">SOURCE <b>HY FOOD INTEL</b><span>·</span> SIGNALS UPDATED ON DEMAND</div>
   </main>
 </div>
 {% endblock %}
-
 {% block scripts %}
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
@@ -3127,146 +3339,82 @@ FILE: ./templates/restaurant.html
 ==================================================
 
 {% extends "base.html" %}
-{% block title %}{{ r.name }} – HY Food Intel{% endblock %}
-
+{% block title %}{{ r.name }} — HY Food Intel{% endblock %}
 {% block content %}
-<div class="max-w-4xl mx-auto p-6">
-  <div class="bg-white shadow rounded-lg p-6 mb-6">
-    <div class="flex justify-between items-start">
-      <div>
-        <h1 class="text-3xl font-bold">{{ r.name }}</h1>
-        <p class="text-slate-500">{{ r.locality or "Hyderabad" }}</p>
-      </div>
-      <a href="{{ r.google_maps_url }}" target="_blank" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Open in Google Maps</a>
+{% set ai = r.ai_analysis or {} %}
+<div class="restaurant-page">
+  <a href="/" class="back-link magnetic">← back to the field</a>
+  <header class="restaurant-hero reveal-block">
+    <div class="hero-copy">
+      <div class="eyebrow">RESTAURANT INTELLIGENCE / PROFILE</div>
+      <h1>{{ r.name }}</h1>
+      <p class="hero-location">{{ r.locality or "Hyderabad" }}{% if r.address %} · {{ r.address }}{% endif %}</p>
+      <div class="hero-actions"><a href="{{ r.google_maps_url }}" target="_blank" class="primary-btn magnetic">Open in Maps ↗</a>{% if r.website %}<a href="{{ r.website }}" target="_blank" class="ghost-btn magnetic">Website ↗</a>{% endif %}</div>
     </div>
+    <div class="hero-score"><span>HYPE SCORE</span><strong>{{ ai.hype_score or "—" }}</strong><small>/ 100</small><em>{{ ai.hype_verdict or "Not rated" }}</em></div>
+  </header>
 
-    <div class="grid grid-cols-2 gap-4 mt-4">
-      <div>
-        <p><span class="font-semibold">Rating:</span> {{ r.rating or "N/A" }} ★</p>
-        <p><span class="font-semibold">Reviews:</span> {{ "{:,}".format(r.review_count) if r.review_count else "N/A" }}</p>
-        <p><span class="font-semibold">Phone:</span> {{ r.phone or "N/A" }}</p>
-        <p><span class="font-semibold">Website:</span> {% if r.website %}<a href="{{ r.website }}" class="text-blue-600 hover:underline" target="_blank">{{ r.website }}</a>{% else %}N/A{% endif %}</p>
-      </div>
-      <div>
-        <p><span class="font-semibold">Open Now:</span> {{ "✅ Yes" if r.is_open_now else "❌ No" }}</p>
-        <p><span class="font-semibold">Menu Source:</span> {{ r.menu_source or "N/A" }}</p>
-        {% if r.qr_menu_url %}<p><span class="font-semibold">QR Menu:</span> <a href="{{ r.qr_menu_url }}" target="_blank" class="text-blue-600 hover:underline">Link</a></p>{% endif %}
-      </div>
-    </div>
-  </div>
+<section class="stat-grid reveal-block">
+  <div class="intel-stat"><span>RATING</span><strong>{{ r.rating or "—" }} <small>★</small></strong><em>{{ "{:,}".format(r.review_count) if r.review_count else "No" }} reviews</em></div>
+  <div class="intel-stat"><span>REVIEW RISK</span><strong>{{ ai.fake_review_risk or "—" }}</strong><em>AI signal</em></div>
+  <div class="intel-stat"><span>SPEND FOR TWO</span><strong>₹{{ ai.calculated_spend_for_two or "—" }}</strong><em>{{ ai.budget_tier or "Budget not rated" }}</em></div>
+  <div class="intel-stat"><span>OPEN NOW</span><strong>{{ "YES" if r.is_open_now else "NO" }}</strong><em>{{ r.menu_source or "Source verified" }}</em></div>
+</section>
 
-  <!-- AI Analysis -->
-  {% set ai = r.ai_analysis or {} %}
-  <div class="bg-white shadow rounded-lg p-6 mb-6">
-    <h2 class="text-xl font-bold mb-3">AI Intelligence</h2>
-    <div class="grid grid-cols-2 gap-4">
-      <div>
-        <p><span class="font-semibold">Hype Score:</span> {{ ai.hype_score or "N/A" }}/100</p>
-        <p><span class="font-semibold">Verdict:</span> {{ ai.hype_verdict or "N/A" }}</p>
-        <p><span class="font-semibold">Fake Review Risk:</span> {{ ai.fake_review_risk or "N/A" }}</p>
-        <p><span class="font-semibold">Budget Tier:</span> {{ ai.budget_tier or "N/A" }}</p>
-        <p><span class="font-semibold">Spend for Two:</span> ₹{{ ai.calculated_spend_for_two or "?" }}</p>
-      </div>
-      <div>
-        <p><span class="font-semibold">Cuisines:</span> {{ ", ".join(ai.cuisines or []) }}</p>
-        <p><span class="font-semibold">Dietary Warning:</span> {{ ai.dietary_warning or "None" }}</p>
-        <p><span class="font-semibold">Remarks:</span> {{ ai.dietary_warning_remarks or "N/A" }}</p>
-        <p><span class="font-semibold">Pure Veg:</span> {{ "✅" if ai.is_pure_veg else "❌" }}</p>
-      </div>
-    </div>
-    <div class="mt-3">
-      <p><span class="font-semibold">Summary:</span> {{ ai.hype_analysis_summary or "N/A" }}</p>
-    </div>
-  </div>
-
-  <!-- Categorized Menu (new) -->
-  {% if r.raw_menu and r.raw_menu|length > 0 %}
-  <div class="bg-white shadow rounded-lg p-6 mb-6">
-    <div class="flex justify-between items-center mb-4">
-      <h2 class="text-xl font-bold">Menu Items</h2>
-      <span class="text-xs text-slate-500">Source: {{ r.menu_source or 'Google Maps' }}</span>
-    </div>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-      {% for item in r.raw_menu %}
-      <div class="flex justify-between items-center p-2.5 bg-slate-50 rounded-lg border border-slate-100">
-        <div>
-          <span class="text-xs font-semibold text-slate-500 uppercase">{{ item.category or 'General' }}</span>
-          <p class="font-medium text-sm text-slate-800">{{ item.name }}</p>
+<!-- Social context moved outside grid -->
+<section class="feature-card reveal-block">
+  <div class="card-kicker">SOCIAL CONTEXT</div>
+  <h2>What People Say</h2>
+  {% if r.social_context and r.social_context.mentions %}
+    <div class="space-y-4">
+      {% for mention in r.social_context.mentions %}
+        <div class="border border-slate-700 rounded-lg p-3 hover:bg-slate-800 transition">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="text-xs font-semibold px-2 py-0.5 rounded-full 
+              {% if mention.source == 'Reddit r/hyderabad' %}bg-orange-900 text-orange-200
+              {% elif mention.source == 'DuckDuckGo Web' %}bg-blue-900 text-blue-200
+              {% elif mention.source == 'Google News' %}bg-purple-900 text-purple-200
+              {% else %}bg-slate-700 text-slate-200{% endif %}">
+              {{ mention.source }}
+            </span>
+            {% if mention.url %}
+              <a href="{{ mention.url }}" target="_blank" class="text-xs text-blue-400 hover:underline">Open ↗</a>
+            {% endif %}
+          </div>
+          <p class="font-medium text-sm text-slate-200">{{ mention.title or 'Untitled mention' }}</p>
+          {% if mention.snippet %}
+            <p class="text-xs text-slate-400 mt-1">{{ mention.snippet[:300] }}{% if mention.snippet|length > 300 %}…{% endif %}</p>
+          {% endif %}
         </div>
-        <span class="text-sm font-bold text-emerald-700">{{ item.price }}</span>
-      </div>
       {% endfor %}
     </div>
-  </div>
+  {% else %}
+    <p class="text-sm text-slate-400">No social mentions collected yet. Run the pipeline with social scouring enabled to populate this section.</p>
+  {% endif %}
+</section>
+
+  <section class="intel-grid reveal-block">
+    <article class="feature-card feature-wide"><div class="card-kicker">AI READ</div><h2>Is the hype justified?</h2><p class="lead">{{ ai.hype_analysis_summary or "No AI summary is available for this restaurant yet." }}</p><div class="tag-row">{% for c in ai.cuisines or [] %}<span>{{ c }}</span>{% endfor %}{% for v in ai.vibe_tags or [] %}<span>{{ v }}</span>{% endfor %}</div></article>
+    <article class="feature-card"><div class="card-kicker">DIETARY</div><h2>{{ ai.dietary_warning or "No warning" }}</h2><p>{{ ai.dietary_warning_remarks or "No additional dietary remarks." }}</p><div class="signal {% if ai.is_pure_veg %}good{% endif %}">{{ "Pure vegetarian" if ai.is_pure_veg else "Mixed menu" }}</div></article>
+    <article class="feature-card"><div class="card-kicker">VERDICT</div><h2>{{ ai.hype_verdict or "Unrated" }}</h2><p>Read the score together with review volume, menu evidence and fake-review risk.</p></article>
+  </section>
+
+  {% if r.raw_menu and r.raw_menu|length > 0 %}
+  <section class="menu-section reveal-block"><div class="section-head"><div><div class="card-kicker">THE MENU</div><h2>What to order</h2></div><span>Source: {{ r.menu_source or 'Google Maps' }}</span></div><div class="menu-grid">{% for item in r.raw_menu %}<div class="menu-item"><div><span>{{ item.category or 'GENERAL' }}</span><strong>{{ item.name }}</strong></div><b>{{ item.price }}</b></div>{% endfor %}</div></section>
   {% endif %}
 
-  <!-- Must Try / Skip -->
-  <div class="grid grid-cols-2 gap-4 mb-6">
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-green-700">✅ Must Try</h3>
-      <ul class="list-disc ml-5">
-        {% for item in ai.must_try_items or [] %}
-        <li>{{ item }}</li>
-        {% else %}
-        <li>None listed</li>
-        {% endfor %}
-      </ul>
-    </div>
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-red-700">❌ Skip</h3>
-      <ul class="list-disc ml-5">
-        {% for item in ai.skip_items or [] %}
-        <li>{{ item }}</li>
-        {% else %}
-        <li>None listed</li>
-        {% endfor %}
-      </ul>
-    </div>
-  </div>
+  <section class="recommend-grid reveal-block"><article class="recommend-card try"><div class="card-kicker">AI PICKS</div><h2>Must try</h2><ul>{% for item in ai.must_try_items or [] %}<li>{{ item }}</li>{% else %}<li>Nothing listed yet.</li>{% endfor %}</ul></article><article class="recommend-card skip"><div class="card-kicker">AI CAUTION</div><h2>Maybe skip</h2><ul>{% for item in ai.skip_items or [] %}<li>{{ item }}</li>{% else %}<li>Nothing flagged yet.</li>{% endfor %}</ul></article><article class="recommend-card flags"><div class="card-kicker">SIGNALS</div><h2>Red flags</h2><ul>{% for flag in ai.red_flags or [] %}<li>{{ flag }}</li>{% else %}<li>None listed.</li>{% endfor %}</ul></article></section>
 
-  <!-- Red Flags & Vibe -->
-  <div class="grid grid-cols-2 gap-4 mb-6">
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-orange-700">🚩 Red Flags</h3>
-      <ul class="list-disc ml-5">
-        {% for flag in ai.red_flags or [] %}
-        <li>{{ flag }}</li>
-        {% else %}
-        <li>None</li>
-        {% endfor %}
-      </ul>
-    </div>
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-purple-700">🎭 Vibe</h3>
-      <ul class="list-disc ml-5">
-        {% for tag in ai.vibe_tags or [] %}
-        <li>{{ tag }}</li>
-        {% else %}
-        <li>Not specified</li>
-        {% endfor %}
-      </ul>
-    </div>
-  </div>
-
-  <!-- Deals -->
-  <div class="bg-white shadow rounded-lg p-6">
-    <h2 class="text-xl font-bold mb-3">Deals & Bookings</h2>
-    <div class="flex gap-4">
-      <a href="{{ deals.swiggy_dineout }}" target="_blank" class="px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700">Swiggy Dineout</a>
-      <a href="{{ deals.zomato_gold }}" target="_blank" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">Zomato Gold</a>
-      <a href="{{ wa_url }}" target="_blank" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700">Share on WhatsApp</a>
-    </div>
-  </div>
+  <section class="deal-bar reveal-block"><div><div class="card-kicker">MAKE IT A PLAN</div><h2>Deals, booking & sharing</h2><p>Go from insight to dinner without leaving the field guide.</p></div><div class="deal-actions"><a class="deal swiggy magnetic" href="{{ deals.swiggy_dineout }}" target="_blank">Swiggy Dineout ↗</a><a class="deal zomato magnetic" href="{{ deals.zomato_gold }}" target="_blank">Zomato ↗</a><a class="deal whatsapp magnetic" href="{{ wa_url }}" target="_blank">Share ↗</a></div></section>
 </div>
 {% endblock %}
-
-==================================================
-FILE: ./data/restaurants.db-shm
-==================================================
-
-
-==================================================
-FILE: ./data/restaurants.db-wal
-==================================================
-
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+  document.querySelectorAll('.reveal-block').forEach((el,i)=>el.style.setProperty('--d',`${i*55}ms`));
+  if(window.anime){anime.animate('.restaurant-page .reveal-block',{opacity:[0,1],y:[26,0],duration:900,delay:anime.stagger(80),ease:'out(4)'});anime.animate('.hero-score strong',{scale:[.75,1],opacity:[0,1],duration:1000,delay:350,ease:'outExpo'})}
+  document.querySelectorAll('.magnetic').forEach(el=>{if(!matchMedia('(pointer:fine)').matches)return;el.addEventListener('pointermove',e=>{const r=el.getBoundingClientRect();const x=(e.clientX-r.left-r.width/2)*.12;const y=(e.clientY-r.top-r.height/2)*.12;el.style.transform=`translate(${x}px,${y}px)`});el.addEventListener('pointerleave',()=>el.style.transform='')});
+});
+</script>
+{% endblock %}
 

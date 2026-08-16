@@ -112,21 +112,26 @@ def upsert_restaurant(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
     social = data.get("social_context")
     social_json = json.dumps(social) if social else data.get("social_context_json")
 
-    # Fix double serialization: only convert to JSON string if not already a string
     raw_menu = data.get("raw_menu") or data.get("raw_menu_json") or []
     raw_menu_json = raw_menu if isinstance(raw_menu, str) else json.dumps(raw_menu)
 
     menu_images = data.get("menu_images") or data.get("menu_images_json") or []
     menu_images_json = menu_images if isinstance(menu_images, str) else json.dumps(menu_images)
 
-    existing = conn.execute("SELECT id FROM restaurants WHERE slug=? OR place_id=?",
-                            (slug, data.get("place_id"))).fetchone()
+    review_count = data.get("review_count")
+    if review_count is None:
+        review_count = data.get("reviews")
+
+    existing = conn.execute(
+        "SELECT id FROM restaurants WHERE slug=? OR place_id=?",
+        (slug, data.get("place_id"))
+    ).fetchone()
 
     fields = {
         "slug": slug,
         "name": data["name"],
         "rating": data.get("rating"),
-        "review_count": data.get("review_count") or data.get("reviews"),
+        "review_count": review_count,
         "locality": data.get("locality"),
         "address": data.get("address"),
         "latitude": data.get("latitude"),
@@ -170,7 +175,6 @@ def upsert_restaurant(conn: sqlite3.Connection, data: dict[str, Any]) -> int:
     conn.commit()
     return row_id
 
-
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     json_keys = (
@@ -205,7 +209,11 @@ def get_restaurant_by_slug(conn: sqlite3.Connection, slug: str) -> dict[str, Any
 
 
 def search_restaurants(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Search using FTS5 with sanitized query; fallback to LIKE."""
     try:
+        # Sanitize for FTS: wrap in double quotes and escape internal quotes
+        safe_query = query.replace('"', '""')
+        match_expr = f'"{safe_query}"'
         rows = conn.execute(
             """
             SELECT r.* FROM restaurants r
@@ -213,16 +221,19 @@ def search_restaurants(conn: sqlite3.Connection, query: str, limit: int = 50) ->
             WHERE fts MATCH ?
             ORDER BY rank LIMIT ?
             """,
-            (query, limit),
+            (match_expr, limit),
         ).fetchall()
+        if rows:
+            return [row_to_dict(r) for r in rows]
+        # If no FTS results, fall back to LIKE
+        raise sqlite3.Error("No FTS results")
     except sqlite3.Error:
-        # Fallback to simple LIKE search if FTS query fails
         like_query = f"%{query}%"
         rows = conn.execute(
             "SELECT * FROM restaurants WHERE name LIKE ? OR locality LIKE ? ORDER BY review_count DESC LIMIT ?",
             (like_query, like_query, limit),
         ).fetchall()
-    return [row_to_dict(r) for r in rows]
+        return [row_to_dict(r) for r in rows]
 
 
 def get_localities(conn: sqlite3.Connection) -> list[str]:

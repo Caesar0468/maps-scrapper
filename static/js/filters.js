@@ -1,6 +1,52 @@
-async function loadFilterOptions(){try{const [cRes,vRes]=await Promise.all([fetch('/api/cuisines'),fetch('/api/vibes')]);const cuisines=await cRes.json(),vibes=await vRes.json();const c=document.getElementById('cuisine-filter'),v=document.getElementById('vibe-filter');c.innerHTML=(cuisines.cuisines||[]).map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');v.innerHTML=(vibes.vibes||[]).map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('')}catch(e){console.warn('Filter options unavailable',e)}}
-function escapeHtml(v){return String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
-function selected(id){return Array.from(document.getElementById(id)?.selectedOptions||[]).map(o=>o.value)}
-function getFilters(){const f={q:document.getElementById('search-input').value.trim(),locality:document.getElementById('locality-filter').value,cuisine:selected('cuisine-filter').join(','),open_now:document.getElementById('open-now-filter').checked,late_night:document.getElementById('late-night-filter').checked,pure_veg:document.getElementById('pure-veg-filter').checked,exclude_avoid_veg:document.getElementById('exclude-avoid-veg').checked,exclude_avoid_nonveg:document.getElementById('exclude-avoid-nonveg').checked,hype:document.getElementById('hype-filter').value,fake_risk:document.getElementById('fake-risk-filter').value,dietary:document.getElementById('dietary-filter').value,low_fake_risk:document.getElementById('low-fake-risk').checked,vibe:selected('vibe-filter').join(','),sort:document.getElementById('sort-select').value};if(Number.isFinite(window.userLat)&&Number.isFinite(window.userLon)&&window.selectedRadius){f.lat=window.userLat;f.lon=window.userLon;f.radius_km=window.selectedRadius}return f}
-function countActiveFilters(f){return ['q','locality','cuisine','open_now','late_night','pure_veg','exclude_avoid_veg','exclude_avoid_nonveg','hype','fake_risk','dietary','low_fake_risk','vibe'].reduce((n,k)=>n+(f[k]?(typeof f[k]==='boolean'?1:1):0),0)+(f.lat&&f.radius_km?1:0)}
-window.getFilters=getFilters;window.countActiveFilters=countActiveFilters;window.loadFilterOptions=loadFilterOptions;document.addEventListener('DOMContentLoaded',loadFilterOptions);
+async function loadFilterOptions(){
+  try{
+    const [cRes,vRes]=await Promise.all([fetch('/api/cuisines'),fetch('/api/vibes')]);
+    const cuisines=await cRes.json(),vibes=await vRes.json();
+    const c=document.getElementById('cuisine-filter'),v=document.getElementById('vibe-filter');
+    c.innerHTML=(cuisines.cuisines||[]).map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
+    v.innerHTML=(vibes.vibes||[]).map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join('');
+  }catch(e){console.warn('Filter options unavailable',e)}
+}
+
+function escapeHtml(v){
+  const map = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+  return String(v ?? '').replace(/[&<>"']/g, ch => map[ch]);
+}
+
+function selected(id){
+  return Array.from(document.getElementById(id)?.selectedOptions||[]).map(o=>o.value);
+}
+
+function getFilters(){
+  const f={
+    q:document.getElementById('search-input').value.trim(),
+    locality:document.getElementById('locality-filter').value,
+    cuisine:selected('cuisine-filter').join(','),
+    open_now:document.getElementById('open-now-filter').checked,
+    late_night:document.getElementById('late-night-filter').checked,
+    pure_veg:document.getElementById('pure-veg-filter').checked,
+    exclude_avoid_veg:document.getElementById('exclude-avoid-veg').checked,
+    exclude_avoid_nonveg:document.getElementById('exclude-avoid-nonveg').checked,
+    hype:document.getElementById('hype-filter').value,
+    fake_risk:document.getElementById('fake-risk-filter').value,
+    dietary:document.getElementById('dietary-filter').value,
+    low_fake_risk:document.getElementById('low-fake-risk').checked,
+    vibe:selected('vibe-filter').join(','),
+    sort:document.getElementById('sort-select').value
+  };
+  if(Number.isFinite(window.userLat)&&Number.isFinite(window.userLon)&&window.selectedRadius){
+    f.lat=window.userLat;
+    f.lon=window.userLon;
+    f.radius_km=window.selectedRadius;
+  }
+  return f;
+}
+
+function countActiveFilters(f){
+  return ['q','locality','cuisine','open_now','late_night','pure_veg','exclude_avoid_veg','exclude_avoid_nonveg','hype','fake_risk','dietary','low_fake_risk','vibe'].reduce((n,k)=>n+(f[k]?(typeof f[k]==='boolean'?1:1):0),0)+(f.lat&&f.radius_km?1:0);
+}
+
+window.getFilters=getFilters;
+window.countActiveFilters=countActiveFilters;
+window.loadFilterOptions=loadFilterOptions;
+document.addEventListener('DOMContentLoaded',loadFilterOptions);

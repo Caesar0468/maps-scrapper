@@ -1,24 +1,14 @@
-"""Local Ollama batch analyzer with optional cloud LLM support (Groq, etc.)."""
-
+"""Restaurant analyzer using multi‑provider LLM."""
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from typing import Any
 
 import httpx
 
-# Default local Ollama settings
-OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "qwen3:8b"
-FALLBACK_MODEL = "llama3.1:8b"
-
-# Optional cloud API (Groq, OpenAI-compatible)
-# Set GROQ_API_KEY to use Groq; otherwise uses local Ollama.
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_GROQ_MODEL = "llama3-8b-8192"
+from pipeline.llm_client import LLMClient
 
 SYSTEM_PROMPT = """You are a Hyderabad food intelligence analyst. Analyze the restaurant using ONLY the provided data.
 Respond with ONLY valid JSON matching this exact schema (no markdown, no extra text):
@@ -95,7 +85,7 @@ def _build_prompt(restaurant: dict[str, Any], social_context: dict[str, Any] | N
 def _extract_json(text: str) -> dict[str, Any]:
     text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     try:
         return json.loads(text)
@@ -141,86 +131,6 @@ def _validate_schema(data: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _call_ollama(prompt: str, model: str = DEFAULT_MODEL, timeout: float = 120.0) -> str:
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "system": SYSTEM_PROMPT,
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.3, "num_predict": 1024},
-    }
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(OLLAMA_URL, json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "")
-
-
-def _call_groq(prompt: str, model: str = DEFAULT_GROQ_MODEL, timeout: float = 30.0) -> str:
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY not set")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1024,
-        "response_format": {"type": "json_object"},
-    }
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(GROQ_API_URL, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
-
-def _call_llm(prompt: str, model: str = None, timeout: float = 120.0) -> str:
-    """Choose between Groq API and local Ollama."""
-    # If GROQ_API_KEY is set, use Groq (faster, free tier available)
-    if os.getenv("GROQ_API_KEY"):
-        groq_model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-        # If caller passed a model, override if it looks like a Groq model? Keep simple: use env or default.
-        if model and model != DEFAULT_MODEL and model != FALLBACK_MODEL:
-            groq_model = model  # assume user wants specific model
-        return _call_groq(prompt, model=groq_model, timeout=timeout)
-    # Otherwise use local Ollama
-    ollama_model = model or DEFAULT_MODEL
-    return _call_ollama(prompt, model=ollama_model, timeout=timeout)
-
-
-def analyze_restaurant(
-    restaurant: dict[str, Any],
-    social_context: dict[str, Any] | None = None,
-    model: str = DEFAULT_MODEL,
-) -> dict[str, Any]:
-    prompt = _build_prompt(restaurant, social_context)
-    models_to_try = [model]
-    if model != FALLBACK_MODEL:
-        models_to_try.append(FALLBACK_MODEL)
-
-    last_error = None
-    for m in models_to_try:
-        try:
-            raw = _call_llm(prompt, model=m)
-            parsed = _extract_json(raw)
-            return _validate_schema(parsed)
-        except Exception as exc:
-            last_error = exc
-            time.sleep(1.0)
-
-    fallback = _validate_schema({})
-    fallback["hype_analysis_summary"] = f"LLM analysis unavailable: {last_error}. Using heuristic defaults."
-    fallback.update(_heuristic_analysis(restaurant))
-    return _validate_schema(fallback)
-
-
 def _heuristic_analysis(restaurant: dict[str, Any]) -> dict[str, Any]:
     name_lower = (restaurant.get("name") or "").lower()
     rating = restaurant.get("rating") or 4.0
@@ -264,37 +174,37 @@ def _heuristic_analysis(restaurant: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def batch_analyze(
-    restaurants: list[dict[str, Any]],
-    social_contexts: dict[int, dict[str, Any]] | None = None,
-    model: str = DEFAULT_MODEL,
-    progress_callback=None,
-) -> list[dict[str, Any]]:
+def analyze_restaurant(restaurant: dict[str, Any], social_context: dict[str, Any] | None = None, model: str | None = None) -> dict[str, Any]:
+    prompt = _build_prompt(restaurant, social_context)
+    try:
+        client = LLMClient(SYSTEM_PROMPT)
+        parsed = client.complete_json(prompt, model=model)
+        return _validate_schema(parsed)
+    except Exception as exc:
+        fallback = _validate_schema({})
+        fallback["hype_analysis_summary"] = f"LLM analysis unavailable: {exc}. Using heuristic defaults."
+        fallback.update(_heuristic_analysis(restaurant))
+        return fallback
+
+
+def batch_analyze(restaurants, social_contexts=None, model=None, progress_callback=None):
     social_contexts = social_contexts or {}
     results = []
     total = len(restaurants)
-
     for idx, restaurant in enumerate(restaurants, start=1):
         name = restaurant.get("name", "")
         ctx = social_contexts.get(idx - 1)
         if progress_callback:
-            progress_callback({
-                "current": idx,
-                "total": total,
-                "name": name,
-                "message": f"Analyzing {name} ({idx}/{total})"
-            })
-
+            progress_callback({"current": idx, "total": total, "name": name, "message": f"Analyzing {name} ({idx}/{total})"})
         analysis = analyze_restaurant(restaurant, ctx, model=model)
         enriched = dict(restaurant)
         enriched["ai_analysis"] = analysis
         results.append(enriched)
         time.sleep(0.5)
-
     return results
 
 
-def check_ollama_available(model: str = DEFAULT_MODEL) -> bool:
+def check_ollama_available(model: str = "qwen3:8b") -> bool:
     """Check if local Ollama is available and has the model."""
     try:
         with httpx.Client(timeout=5.0) as client:

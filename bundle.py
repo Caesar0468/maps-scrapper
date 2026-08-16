@@ -2,7 +2,7 @@ import os
 
 repo_dir = "."
 output_file = "all_codebase.txt"
-ignore_ext = {".db", ".pyc", ".png", ".jpg", ".zip", ".tar", ".gz", ".DS_Store"}
+ignore_ext = {".db", ".pyc", ".png", ".env", ".jpg", ".zip", ".tar", ".gz", ".DS_Store"}
 ignore_dirs = {".git", "__pycache__", ".venv", "venv", ".idea", ".vscode"}
 
 with open(output_file, "w", encoding="utf-8") as out:

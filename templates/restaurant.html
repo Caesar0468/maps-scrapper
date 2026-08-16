@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ r.name }} — HY Food Intel{% endblock %}
+{% block title %}{{ r.name | e }} — HY Food Intel{% endblock %}
 {% block content %}
 {% set ai = r.ai_analysis or {} %}
 <div class="restaurant-page">
@@ -7,33 +7,68 @@
   <header class="restaurant-hero reveal-block">
     <div class="hero-copy">
       <div class="eyebrow">RESTAURANT INTELLIGENCE / PROFILE</div>
-      <h1>{{ r.name }}</h1>
-      <p class="hero-location">{{ r.locality or "Hyderabad" }}{% if r.address %} · {{ r.address }}{% endif %}</p>
-      <div class="hero-actions"><a href="{{ r.google_maps_url }}" target="_blank" class="primary-btn magnetic">Open in Maps ↗</a>{% if r.website %}<a href="{{ r.website }}" target="_blank" class="ghost-btn magnetic">Website ↗</a>{% endif %}</div>
+      <h1>{{ r.name | e }}</h1>
+      <p class="hero-location">{{ r.locality | e or "Hyderabad" }}{% if r.address %} · {{ r.address | e }}{% endif %}</p>
+      <div class="hero-actions">
+        {% if r.google_maps_url %}<a href="{{ r.google_maps_url | e }}" target="_blank" class="primary-btn magnetic">Open in Maps ↗</a>{% endif %}
+        {% if r.website %}<a href="{{ r.website | e }}" target="_blank" class="ghost-btn magnetic">Website ↗</a>{% endif %}
+      </div>
     </div>
     <div class="hero-score"><span>HYPE SCORE</span><strong>{{ ai.hype_score or "—" }}</strong><small>/ 100</small><em>{{ ai.hype_verdict or "Not rated" }}</em></div>
   </header>
 
   <section class="stat-grid reveal-block">
-    <div class="intel-stat"><span>RATING</span><strong data-counter="{{ r.rating or 0 }}">{{ r.rating or "—" }} <small>★</small></strong><em>{{ "{:,}".format(r.review_count) if r.review_count else "No" }} reviews</em></div>
+    <div class="intel-stat"><span>RATING</span><strong>{{ r.rating or "—" }} <small>★</small></strong><em>{{ "{:,}".format(r.review_count) if r.review_count else "No" }} reviews</em></div>
     <div class="intel-stat"><span>REVIEW RISK</span><strong>{{ ai.fake_review_risk or "—" }}</strong><em>AI signal</em></div>
     <div class="intel-stat"><span>SPEND FOR TWO</span><strong>₹{{ ai.calculated_spend_for_two or "—" }}</strong><em>{{ ai.budget_tier or "Budget not rated" }}</em></div>
     <div class="intel-stat"><span>OPEN NOW</span><strong>{{ "YES" if r.is_open_now else "NO" }}</strong><em>{{ r.menu_source or "Source verified" }}</em></div>
   </section>
 
+  <!-- Social context moved outside stat-grid -->
+  <section class="feature-card reveal-block">
+    <div class="card-kicker">SOCIAL CONTEXT</div>
+    <h2>What People Say</h2>
+    {% if r.social_context and r.social_context.mentions %}
+      <div class="space-y-4">
+        {% for mention in r.social_context.mentions %}
+          <div class="border border-slate-700 rounded-lg p-3 hover:bg-slate-800 transition">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-xs font-semibold px-2 py-0.5 rounded-full 
+                {% if mention.source == 'Reddit r/hyderabad' %}bg-orange-900 text-orange-200
+                {% elif mention.source == 'DuckDuckGo Web' %}bg-blue-900 text-blue-200
+                {% elif mention.source == 'Google News' %}bg-purple-900 text-purple-200
+                {% else %}bg-slate-700 text-slate-200{% endif %}">
+                {{ mention.source | e }}
+              </span>
+              {% if mention.url %}
+                <a href="{{ mention.url | e }}" target="_blank" class="text-xs text-blue-400 hover:underline">Open ↗</a>
+              {% endif %}
+            </div>
+            <p class="font-medium text-sm text-slate-200">{{ mention.title | e or 'Untitled mention' }}</p>
+            {% if mention.snippet %}
+              <p class="text-xs text-slate-400 mt-1">{{ mention.snippet[:300] | e }}{% if mention.snippet|length > 300 %}…{% endif %}</p>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="text-sm text-slate-400">No social mentions collected yet. Run the pipeline with social scouring enabled to populate this section.</p>
+    {% endif %}
+  </section>
+
   <section class="intel-grid reveal-block">
-    <article class="feature-card feature-wide"><div class="card-kicker">AI READ</div><h2>Is the hype justified?</h2><p class="lead">{{ ai.hype_analysis_summary or "No AI summary is available for this restaurant yet." }}</p><div class="tag-row">{% for c in ai.cuisines or [] %}<span>{{ c }}</span>{% endfor %}{% for v in ai.vibe_tags or [] %}<span>{{ v }}</span>{% endfor %}</div></article>
-    <article class="feature-card"><div class="card-kicker">DIETARY</div><h2>{{ ai.dietary_warning or "No warning" }}</h2><p>{{ ai.dietary_warning_remarks or "No additional dietary remarks." }}</p><div class="signal {% if ai.is_pure_veg %}good{% endif %}">{{ "Pure vegetarian" if ai.is_pure_veg else "Mixed menu" }}</div></article>
-    <article class="feature-card"><div class="card-kicker">VERDICT</div><h2>{{ ai.hype_verdict or "Unrated" }}</h2><p>Read the score together with review volume, menu evidence and fake-review risk.</p></article>
+    <article class="feature-card feature-wide"><div class="card-kicker">AI READ</div><h2>Is the hype justified?</h2><p class="lead">{{ ai.hype_analysis_summary | e or "No AI summary is available for this restaurant yet." }}</p><div class="tag-row">{% for c in ai.cuisines or [] %}<span>{{ c | e }}</span>{% endfor %}{% for v in ai.vibe_tags or [] %}<span>{{ v | e }}</span>{% endfor %}</div></article>
+    <article class="feature-card"><div class="card-kicker">DIETARY</div><h2>{{ ai.dietary_warning | e or "No warning" }}</h2><p>{{ ai.dietary_warning_remarks | e or "No additional dietary remarks." }}</p><div class="signal {% if ai.is_pure_veg %}good{% endif %}">{{ "Pure vegetarian" if ai.is_pure_veg else "Mixed menu" }}</div></article>
+    <article class="feature-card"><div class="card-kicker">VERDICT</div><h2>{{ ai.hype_verdict | e or "Unrated" }}</h2><p>Read the score together with review volume, menu evidence and fake-review risk.</p></article>
   </section>
 
   {% if r.raw_menu and r.raw_menu|length > 0 %}
-  <section class="menu-section reveal-block"><div class="section-head"><div><div class="card-kicker">THE MENU</div><h2>What to order</h2></div><span>Source: {{ r.menu_source or 'Google Maps' }}</span></div><div class="menu-grid">{% for item in r.raw_menu %}<div class="menu-item"><div><span>{{ item.category or 'GENERAL' }}</span><strong>{{ item.name }}</strong></div><b>{{ item.price }}</b></div>{% endfor %}</div></section>
+  <section class="menu-section reveal-block"><div class="section-head"><div><div class="card-kicker">THE MENU</div><h2>What to order</h2></div><span>Source: {{ r.menu_source | e or 'Google Maps' }}</span></div><div class="menu-grid">{% for item in r.raw_menu %}<div class="menu-item"><div><span>{{ item.category | e or 'GENERAL' }}</span><strong>{{ item.name | e }}</strong></div><b>{{ item.price | e }}</b></div>{% endfor %}</div></section>
   {% endif %}
 
-  <section class="recommend-grid reveal-block"><article class="recommend-card try"><div class="card-kicker">AI PICKS</div><h2>Must try</h2><ul>{% for item in ai.must_try_items or [] %}<li>{{ item }}</li>{% else %}<li>Nothing listed yet.</li>{% endfor %}</ul></article><article class="recommend-card skip"><div class="card-kicker">AI CAUTION</div><h2>Maybe skip</h2><ul>{% for item in ai.skip_items or [] %}<li>{{ item }}</li>{% else %}<li>Nothing flagged yet.</li>{% endfor %}</ul></article><article class="recommend-card flags"><div class="card-kicker">SIGNALS</div><h2>Red flags</h2><ul>{% for flag in ai.red_flags or [] %}<li>{{ flag }}</li>{% else %}<li>None listed.</li>{% endfor %}</ul></article></section>
+  <section class="recommend-grid reveal-block"><article class="recommend-card try"><div class="card-kicker">AI PICKS</div><h2>Must try</h2><ul>{% for item in ai.must_try_items or [] %}<li>{{ item | e }}</li>{% else %}<li>Nothing listed yet.</li>{% endfor %}</ul></article><article class="recommend-card skip"><div class="card-kicker">AI CAUTION</div><h2>Maybe skip</h2><ul>{% for item in ai.skip_items or [] %}<li>{{ item | e }}</li>{% else %}<li>Nothing flagged yet.</li>{% endfor %}</ul></article><article class="recommend-card flags"><div class="card-kicker">SIGNALS</div><h2>Red flags</h2><ul>{% for flag in ai.red_flags or [] %}<li>{{ flag | e }}</li>{% else %}<li>None listed.</li>{% endfor %}</ul></article></section>
 
-  <section class="deal-bar reveal-block"><div><div class="card-kicker">MAKE IT A PLAN</div><h2>Deals, booking & sharing</h2><p>Go from insight to dinner without leaving the field guide.</p></div><div class="deal-actions"><a class="deal swiggy magnetic" href="{{ deals.swiggy_dineout }}" target="_blank">Swiggy Dineout ↗</a><a class="deal zomato magnetic" href="{{ deals.zomato_gold }}" target="_blank">Zomato ↗</a><a class="deal whatsapp magnetic" href="{{ wa_url }}" target="_blank">Share ↗</a></div></section>
+  <section class="deal-bar reveal-block"><div><div class="card-kicker">MAKE IT A PLAN</div><h2>Deals, booking & sharing</h2><p>Go from insight to dinner without leaving the field guide.</p></div><div class="deal-actions"><a class="deal swiggy magnetic" href="{{ deals.swiggy_dineout | e }}" target="_blank">Swiggy Dineout ↗</a><a class="deal zomato magnetic" href="{{ deals.zomato_gold | e }}" target="_blank">Zomato ↗</a><a class="deal whatsapp magnetic" href="{{ wa_url | e }}" target="_blank">Share ↗</a></div></section>
 </div>
 {% endblock %}
 {% block scripts %}

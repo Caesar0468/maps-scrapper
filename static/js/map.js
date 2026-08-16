@@ -6,7 +6,16 @@ let fetchController = null;
 let lastRestaurants = [];
 
 const $ = id => document.getElementById(id);
-const safe = v => String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const safe = (v) => {
+    const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+    };
+    return String(v ?? '').replace(/[&<>"']/g, ch => map[ch]);
+};
 
 const VERDICT = {
   'Hidden Gem': 'gem',

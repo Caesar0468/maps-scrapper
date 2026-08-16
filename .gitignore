@@ -22,3 +22,5 @@ Thumbs.db
 
 # Playwright & browser downloads
 .playwright/
+
+.env
