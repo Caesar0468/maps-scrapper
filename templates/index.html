@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}HY Food Intel — Telangana Restaurant Map{% endblock %}
+
+{% block content %}
+<div id="app" class="flex h-[calc(100vh-57px)] overflow-hidden">
+  <!-- Filter Sidebar -->
+  <aside id="sidebar" class="w-[420px] min-w-[320px] bg-white border-r border-slate-200 flex flex-col transition-all duration-200 z-20 shadow-lg">
+    <div class="p-4 border-b border-slate-100">
+      <div class="flex items-center justify-between mb-1">
+        <h1 class="text-lg font-bold">Restaurant Explorer</h1>
+        <button id="collapse-btn" class="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50" title="Collapse">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
+      </div>
+      <p class="text-xs text-slate-500">4.0+ ★ · 1K+ reviews · AI-enriched</p>
+      <div id="count-badge" class="mt-2 inline-block px-3 py-1 bg-blue-50 text-blue-700 text-xs font-semibold rounded-full">Loading…</div>
+    </div>
+
+    <!-- Filter Drawer -->
+    <div class="p-4 border-b border-slate-100 space-y-3 overflow-y-auto max-h-[50vh] filter-drawer">
+      <div class="relative">
+        <input type="search" id="search-input" placeholder="Search name, dish, cuisine…"
+               class="w-full pl-9 pr-3 py-2 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none">
+        <svg class="absolute left-3 top-2.5 text-slate-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      </div>
+
+      <div class="grid grid-cols-2 gap-2">
+        <select id="locality-filter" class="text-xs border border-slate-200 rounded-lg px-2 py-2">
+          <option value="">All Localities</option>
+          {% for loc in localities %}
+          <option value="{{ loc }}">{{ loc }}</option>
+          {% endfor %}
+        </select>
+        <select id="sort-select" class="text-xs border border-slate-200 rounded-lg px-2 py-2">
+          <option value="reviews">Most Reviews</option>
+          <option value="rating">Highest Rating</option>
+          <option value="hype">Hype Score</option>
+          <option value="distance">Nearest</option>
+          <option value="name">Name A-Z</option>
+        </select>
+      </div>
+
+      <!-- Cuisine pills -->
+      <div>
+        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Cuisine</label>
+        <div id="cuisine-pills" class="flex flex-wrap gap-1.5 mt-1.5">
+          {% for c in ["Biryani","South Indian","Chinese","Mughlai","Continental","Chaat","Mandi","Cafe"] %}
+          <button class="cuisine-pill px-2.5 py-1 text-xs rounded-full border border-slate-200 hover:bg-blue-50" data-cuisine="{{ c }}">{{ c }}</button>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Toggle filters -->
+      <div class="space-y-2">
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="open-now-filter" class="rounded border-slate-300 text-blue-600">
+          <span>Open Now</span>
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="pure-veg-filter" class="rounded border-slate-300 text-green-600">
+          <span>Pure Veg Only</span>
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="exclude-avoid-veg" class="rounded border-slate-300 text-orange-600">
+          <span>Exclude "Avoid Veg" flagged</span>
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="exclude-avoid-nonveg" class="rounded border-slate-300 text-orange-600">
+          <span>Exclude "Avoid Non-Veg" flagged</span>
+        </label>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="low-fake-risk" class="rounded border-slate-300 text-emerald-600">
+          <span>Low Fake-Review Risk Only</span>
+        </label>
+      </div>
+
+      <!-- Hype verdict -->
+      <div>
+        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Hype Verdict</label>
+        <select id="hype-filter" class="w-full mt-1 text-xs border border-slate-200 rounded-lg px-2 py-2">
+          <option value="">All Verdicts</option>
+          <option value="Hidden Gem">Hidden Gem</option>
+          <option value="Justified Hype">Justified Hype</option>
+          <option value="Reliable Classic">Reliable Classic</option>
+          <option value="Overhyped">Overhyped</option>
+        </select>
+      </div>
+
+      <!-- Budget slider -->
+      <div>
+        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          Spend for Two: ₹<span id="budget-min-label">100</span> – ₹<span id="budget-max-label">5000+</span>
+        </label>
+        <div class="flex gap-2 mt-1">
+          <input type="range" id="budget-min" min="100" max="5000" value="100" step="100" class="flex-1 accent-blue-600">
+          <input type="range" id="budget-max" min="100" max="5000" value="5000" step="100" class="flex-1 accent-blue-600">
+        </div>
+      </div>
+
+      <!-- Vibe tags -->
+      <div>
+        <label class="text-xs font-semibold text-slate-500 uppercase tracking-wide">Vibes</label>
+        <select id="vibe-filter" class="w-full mt-1 text-xs border border-slate-200 rounded-lg px-2 py-2">
+          <option value="">All Vibes</option>
+          <option value="Late Night">Late Night (Past 12 AM)</option>
+          <option value="Family Dining">Family Dining</option>
+          <option value="Student Spot">Hostel / Student Spot</option>
+          <option value="Work Cafe">Work Cafe</option>
+          <option value="Date Night">Date Night</option>
+        </select>
+      </div>
+
+      <!-- GPS / Distance -->
+      <div>
+        <button id="gps-btn" class="w-full py-2 text-sm font-medium bg-emerald-600 text-white rounded-xl hover:bg-emerald-700 transition">
+          📍 Use My Location
+        </button>
+        <div id="distance-chips" class="flex flex-wrap gap-1.5 mt-2 hidden">
+          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200" data-km="2">&lt;2 km</button>
+          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200" data-km="5">&lt;5 km</button>
+          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200" data-km="10">&lt;10 km</button>
+          <button class="dist-chip px-2.5 py-1 text-xs rounded-full border border-slate-200 active" data-km="999">All</button>
+        </div>
+      </div>
+
+      <div class="flex gap-2">
+        <button id="pipeline-btn" class="flex-1 py-2 text-xs font-medium bg-blue-600 text-white rounded-xl hover:bg-blue-700">Run Pipeline</button>
+        <button id="reset-filters" class="px-3 py-2 text-xs border border-slate-200 rounded-xl hover:bg-slate-50">Reset</button>
+      </div>
+      <div id="pipeline-status" class="hidden text-xs p-2 bg-amber-50 border border-amber-200 rounded-lg"></div>
+    </div>
+
+    <!-- Restaurant List -->
+    <ul id="restaurant-list" class="flex-1 overflow-y-auto p-2 space-y-1"></ul>
+    <div id="empty-state" class="hidden p-6 text-center text-sm text-slate-500">
+      <p>No restaurants match your filters.</p>
+      <p class="mt-1 text-xs">Run the pipeline to populate data.</p>
+    </div>
+  </aside>
+
+  <!-- Map -->
+  <main class="flex-1 relative">
+    <button id="expand-btn" class="hidden absolute top-4 left-4 z-[1000] p-2 bg-white rounded-lg shadow border border-slate-200">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+    </button>
+    <div id="map" class="w-full h-full"></div>
+  </main>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script src="/static/js/filters.js"></script>
+<script src="/static/js/map.js"></script>
+{% endblock %}
