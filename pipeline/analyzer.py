@@ -1,17 +1,24 @@
-"""Local Ollama batch analyzer with strict JSON schema enforcement."""
+"""Local Ollama batch analyzer with optional cloud LLM support (Groq, etc.)."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
 
 import httpx
 
+# Default local Ollama settings
 OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen3:8b"
 FALLBACK_MODEL = "llama3.1:8b"
+
+# Optional cloud API (Groq, OpenAI-compatible)
+# Set GROQ_API_KEY to use Groq; otherwise uses local Ollama.
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_GROQ_MODEL = "llama3-8b-8192"
 
 SYSTEM_PROMPT = """You are a Hyderabad food intelligence analyst. Analyze the restaurant using ONLY the provided data.
 Respond with ONLY valid JSON matching this exact schema (no markdown, no extra text):
@@ -56,6 +63,14 @@ SCHEMA_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y")
+    return bool(value)
+
+
 def _build_prompt(restaurant: dict[str, Any], social_context: dict[str, Any] | None) -> str:
     menu_items = restaurant.get("raw_menu") or restaurant.get("raw_menu_json") or []
     if isinstance(menu_items, str):
@@ -78,7 +93,6 @@ def _build_prompt(restaurant: dict[str, Any], social_context: dict[str, Any] | N
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    # Remove thinking tags (common in reasoning models)
     text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -122,8 +136,8 @@ def _validate_schema(data: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result[list_key], list):
             result[list_key] = SCHEMA_DEFAULTS[list_key]
 
-    result["is_pure_veg"] = bool(result.get("is_pure_veg"))
-    result["open_late_night"] = bool(result.get("open_late_night"))
+    result["is_pure_veg"] = _to_bool(result.get("is_pure_veg", False))
+    result["open_late_night"] = _to_bool(result.get("open_late_night", False))
     return result
 
 
@@ -142,6 +156,45 @@ def _call_ollama(prompt: str, model: str = DEFAULT_MODEL, timeout: float = 120.0
         return resp.json().get("response", "")
 
 
+def _call_groq(prompt: str, model: str = DEFAULT_GROQ_MODEL, timeout: float = 30.0) -> str:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not set")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1024,
+        "response_format": {"type": "json_object"},
+    }
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(GROQ_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+
+def _call_llm(prompt: str, model: str = None, timeout: float = 120.0) -> str:
+    """Choose between Groq API and local Ollama."""
+    # If GROQ_API_KEY is set, use Groq (faster, free tier available)
+    if os.getenv("GROQ_API_KEY"):
+        groq_model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
+        # If caller passed a model, override if it looks like a Groq model? Keep simple: use env or default.
+        if model and model != DEFAULT_MODEL and model != FALLBACK_MODEL:
+            groq_model = model  # assume user wants specific model
+        return _call_groq(prompt, model=groq_model, timeout=timeout)
+    # Otherwise use local Ollama
+    ollama_model = model or DEFAULT_MODEL
+    return _call_ollama(prompt, model=ollama_model, timeout=timeout)
+
+
 def analyze_restaurant(
     restaurant: dict[str, Any],
     social_context: dict[str, Any] | None = None,
@@ -155,7 +208,7 @@ def analyze_restaurant(
     last_error = None
     for m in models_to_try:
         try:
-            raw = _call_ollama(prompt, model=m)
+            raw = _call_llm(prompt, model=m)
             parsed = _extract_json(raw)
             return _validate_schema(parsed)
         except Exception as exc:
@@ -165,11 +218,10 @@ def analyze_restaurant(
     fallback = _validate_schema({})
     fallback["hype_analysis_summary"] = f"LLM analysis unavailable: {last_error}. Using heuristic defaults."
     fallback.update(_heuristic_analysis(restaurant))
-    return fallback
+    return _validate_schema(fallback)
 
 
 def _heuristic_analysis(restaurant: dict[str, Any]) -> dict[str, Any]:
-    """Offline heuristic fallback when Ollama is unavailable."""
     name_lower = (restaurant.get("name") or "").lower()
     rating = restaurant.get("rating") or 4.0
     reviews = restaurant.get("review_count") or 1000
@@ -204,12 +256,17 @@ def _heuristic_analysis(restaurant: dict[str, Any]) -> dict[str, Any]:
         "dietary_warning_remarks": remarks,
         "calculated_spend_for_two": 600 if "budget" in name_lower else 900,
         "budget_tier": "Moderate (₹500-₹1200)",
+        "must_try_items": [],
+        "skip_items": [],
+        "red_flags": [],
+        "vibe_tags": ["Family Dining"],
+        "open_late_night": False,
     }
 
 
 def batch_analyze(
     restaurants: list[dict[str, Any]],
-    social_contexts: dict[str, dict[str, Any]] | None = None,
+    social_contexts: dict[int, dict[str, Any]] | None = None,
     model: str = DEFAULT_MODEL,
     progress_callback=None,
 ) -> list[dict[str, Any]]:
@@ -219,9 +276,14 @@ def batch_analyze(
 
     for idx, restaurant in enumerate(restaurants, start=1):
         name = restaurant.get("name", "")
-        ctx = social_contexts.get(name)
+        ctx = social_contexts.get(idx - 1)
         if progress_callback:
-            progress_callback({"current": idx, "total": total, "name": name})
+            progress_callback({
+                "current": idx,
+                "total": total,
+                "name": name,
+                "message": f"Analyzing {name} ({idx}/{total})"
+            })
 
         analysis = analyze_restaurant(restaurant, ctx, model=model)
         enriched = dict(restaurant)
@@ -233,6 +295,7 @@ def batch_analyze(
 
 
 def check_ollama_available(model: str = DEFAULT_MODEL) -> bool:
+    """Check if local Ollama is available and has the model."""
     try:
         with httpx.Client(timeout=5.0) as client:
             resp = client.get("http://localhost:11434/api/tags")

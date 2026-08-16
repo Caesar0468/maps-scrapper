@@ -1,133 +1,47 @@
 {% extends "base.html" %}
-{% block title %}{{ r.name }} – HY Food Intel{% endblock %}
-
+{% block title %}{{ r.name }} — HY Food Intel{% endblock %}
 {% block content %}
-<div class="max-w-4xl mx-auto p-6">
-  <div class="bg-white shadow rounded-lg p-6 mb-6">
-    <div class="flex justify-between items-start">
-      <div>
-        <h1 class="text-3xl font-bold">{{ r.name }}</h1>
-        <p class="text-slate-500">{{ r.locality or "Hyderabad" }}</p>
-      </div>
-      <a href="{{ r.google_maps_url }}" target="_blank" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Open in Google Maps</a>
+{% set ai = r.ai_analysis or {} %}
+<div class="restaurant-page">
+  <a href="/" class="back-link magnetic">← back to the field</a>
+  <header class="restaurant-hero reveal-block">
+    <div class="hero-copy">
+      <div class="eyebrow">RESTAURANT INTELLIGENCE / PROFILE</div>
+      <h1>{{ r.name }}</h1>
+      <p class="hero-location">{{ r.locality or "Hyderabad" }}{% if r.address %} · {{ r.address }}{% endif %}</p>
+      <div class="hero-actions"><a href="{{ r.google_maps_url }}" target="_blank" class="primary-btn magnetic">Open in Maps ↗</a>{% if r.website %}<a href="{{ r.website }}" target="_blank" class="ghost-btn magnetic">Website ↗</a>{% endif %}</div>
     </div>
+    <div class="hero-score"><span>HYPE SCORE</span><strong>{{ ai.hype_score or "—" }}</strong><small>/ 100</small><em>{{ ai.hype_verdict or "Not rated" }}</em></div>
+  </header>
 
-    <div class="grid grid-cols-2 gap-4 mt-4">
-      <div>
-        <p><span class="font-semibold">Rating:</span> {{ r.rating or "N/A" }} ★</p>
-        <p><span class="font-semibold">Reviews:</span> {{ "{:,}".format(r.review_count) if r.review_count else "N/A" }}</p>
-        <p><span class="font-semibold">Phone:</span> {{ r.phone or "N/A" }}</p>
-        <p><span class="font-semibold">Website:</span> {% if r.website %}<a href="{{ r.website }}" class="text-blue-600 hover:underline" target="_blank">{{ r.website }}</a>{% else %}N/A{% endif %}</p>
-      </div>
-      <div>
-        <p><span class="font-semibold">Open Now:</span> {{ "✅ Yes" if r.is_open_now else "❌ No" }}</p>
-        <p><span class="font-semibold">Menu Source:</span> {{ r.menu_source or "N/A" }}</p>
-        {% if r.qr_menu_url %}<p><span class="font-semibold">QR Menu:</span> <a href="{{ r.qr_menu_url }}" target="_blank" class="text-blue-600 hover:underline">Link</a></p>{% endif %}
-      </div>
-    </div>
-  </div>
+  <section class="stat-grid reveal-block">
+    <div class="intel-stat"><span>RATING</span><strong data-counter="{{ r.rating or 0 }}">{{ r.rating or "—" }} <small>★</small></strong><em>{{ "{:,}".format(r.review_count) if r.review_count else "No" }} reviews</em></div>
+    <div class="intel-stat"><span>REVIEW RISK</span><strong>{{ ai.fake_review_risk or "—" }}</strong><em>AI signal</em></div>
+    <div class="intel-stat"><span>SPEND FOR TWO</span><strong>₹{{ ai.calculated_spend_for_two or "—" }}</strong><em>{{ ai.budget_tier or "Budget not rated" }}</em></div>
+    <div class="intel-stat"><span>OPEN NOW</span><strong>{{ "YES" if r.is_open_now else "NO" }}</strong><em>{{ r.menu_source or "Source verified" }}</em></div>
+  </section>
 
-  <!-- AI Analysis -->
-  {% set ai = r.ai_analysis or {} %}
-  <div class="bg-white shadow rounded-lg p-6 mb-6">
-    <h2 class="text-xl font-bold mb-3">AI Intelligence</h2>
-    <div class="grid grid-cols-2 gap-4">
-      <div>
-        <p><span class="font-semibold">Hype Score:</span> {{ ai.hype_score or "N/A" }}/100</p>
-        <p><span class="font-semibold">Verdict:</span> {{ ai.hype_verdict or "N/A" }}</p>
-        <p><span class="font-semibold">Fake Review Risk:</span> {{ ai.fake_review_risk or "N/A" }}</p>
-        <p><span class="font-semibold">Budget Tier:</span> {{ ai.budget_tier or "N/A" }}</p>
-        <p><span class="font-semibold">Spend for Two:</span> ₹{{ ai.calculated_spend_for_two or "?" }}</p>
-      </div>
-      <div>
-        <p><span class="font-semibold">Cuisines:</span> {{ ", ".join(ai.cuisines or []) }}</p>
-        <p><span class="font-semibold">Dietary Warning:</span> {{ ai.dietary_warning or "None" }}</p>
-        <p><span class="font-semibold">Remarks:</span> {{ ai.dietary_warning_remarks or "N/A" }}</p>
-        <p><span class="font-semibold">Pure Veg:</span> {{ "✅" if ai.is_pure_veg else "❌" }}</p>
-      </div>
-    </div>
-    <div class="mt-3">
-      <p><span class="font-semibold">Summary:</span> {{ ai.hype_analysis_summary or "N/A" }}</p>
-    </div>
-  </div>
+  <section class="intel-grid reveal-block">
+    <article class="feature-card feature-wide"><div class="card-kicker">AI READ</div><h2>Is the hype justified?</h2><p class="lead">{{ ai.hype_analysis_summary or "No AI summary is available for this restaurant yet." }}</p><div class="tag-row">{% for c in ai.cuisines or [] %}<span>{{ c }}</span>{% endfor %}{% for v in ai.vibe_tags or [] %}<span>{{ v }}</span>{% endfor %}</div></article>
+    <article class="feature-card"><div class="card-kicker">DIETARY</div><h2>{{ ai.dietary_warning or "No warning" }}</h2><p>{{ ai.dietary_warning_remarks or "No additional dietary remarks." }}</p><div class="signal {% if ai.is_pure_veg %}good{% endif %}">{{ "Pure vegetarian" if ai.is_pure_veg else "Mixed menu" }}</div></article>
+    <article class="feature-card"><div class="card-kicker">VERDICT</div><h2>{{ ai.hype_verdict or "Unrated" }}</h2><p>Read the score together with review volume, menu evidence and fake-review risk.</p></article>
+  </section>
 
-  <!-- Categorized Menu (new) -->
   {% if r.raw_menu and r.raw_menu|length > 0 %}
-  <div class="bg-white shadow rounded-lg p-6 mb-6">
-    <div class="flex justify-between items-center mb-4">
-      <h2 class="text-xl font-bold">Menu Items</h2>
-      <span class="text-xs text-slate-500">Source: {{ r.menu_source or 'Google Maps' }}</span>
-    </div>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-      {% for item in r.raw_menu %}
-      <div class="flex justify-between items-center p-2.5 bg-slate-50 rounded-lg border border-slate-100">
-        <div>
-          <span class="text-xs font-semibold text-slate-500 uppercase">{{ item.category or 'General' }}</span>
-          <p class="font-medium text-sm text-slate-800">{{ item.name }}</p>
-        </div>
-        <span class="text-sm font-bold text-emerald-700">{{ item.price }}</span>
-      </div>
-      {% endfor %}
-    </div>
-  </div>
+  <section class="menu-section reveal-block"><div class="section-head"><div><div class="card-kicker">THE MENU</div><h2>What to order</h2></div><span>Source: {{ r.menu_source or 'Google Maps' }}</span></div><div class="menu-grid">{% for item in r.raw_menu %}<div class="menu-item"><div><span>{{ item.category or 'GENERAL' }}</span><strong>{{ item.name }}</strong></div><b>{{ item.price }}</b></div>{% endfor %}</div></section>
   {% endif %}
 
-  <!-- Must Try / Skip -->
-  <div class="grid grid-cols-2 gap-4 mb-6">
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-green-700">✅ Must Try</h3>
-      <ul class="list-disc ml-5">
-        {% for item in ai.must_try_items or [] %}
-        <li>{{ item }}</li>
-        {% else %}
-        <li>None listed</li>
-        {% endfor %}
-      </ul>
-    </div>
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-red-700">❌ Skip</h3>
-      <ul class="list-disc ml-5">
-        {% for item in ai.skip_items or [] %}
-        <li>{{ item }}</li>
-        {% else %}
-        <li>None listed</li>
-        {% endfor %}
-      </ul>
-    </div>
-  </div>
+  <section class="recommend-grid reveal-block"><article class="recommend-card try"><div class="card-kicker">AI PICKS</div><h2>Must try</h2><ul>{% for item in ai.must_try_items or [] %}<li>{{ item }}</li>{% else %}<li>Nothing listed yet.</li>{% endfor %}</ul></article><article class="recommend-card skip"><div class="card-kicker">AI CAUTION</div><h2>Maybe skip</h2><ul>{% for item in ai.skip_items or [] %}<li>{{ item }}</li>{% else %}<li>Nothing flagged yet.</li>{% endfor %}</ul></article><article class="recommend-card flags"><div class="card-kicker">SIGNALS</div><h2>Red flags</h2><ul>{% for flag in ai.red_flags or [] %}<li>{{ flag }}</li>{% else %}<li>None listed.</li>{% endfor %}</ul></article></section>
 
-  <!-- Red Flags & Vibe -->
-  <div class="grid grid-cols-2 gap-4 mb-6">
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-orange-700">🚩 Red Flags</h3>
-      <ul class="list-disc ml-5">
-        {% for flag in ai.red_flags or [] %}
-        <li>{{ flag }}</li>
-        {% else %}
-        <li>None</li>
-        {% endfor %}
-      </ul>
-    </div>
-    <div class="bg-white shadow rounded-lg p-4">
-      <h3 class="font-bold text-purple-700">🎭 Vibe</h3>
-      <ul class="list-disc ml-5">
-        {% for tag in ai.vibe_tags or [] %}
-        <li>{{ tag }}</li>
-        {% else %}
-        <li>Not specified</li>
-        {% endfor %}
-      </ul>
-    </div>
-  </div>
-
-  <!-- Deals -->
-  <div class="bg-white shadow rounded-lg p-6">
-    <h2 class="text-xl font-bold mb-3">Deals & Bookings</h2>
-    <div class="flex gap-4">
-      <a href="{{ deals.swiggy_dineout }}" target="_blank" class="px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700">Swiggy Dineout</a>
-      <a href="{{ deals.zomato_gold }}" target="_blank" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">Zomato Gold</a>
-      <a href="{{ wa_url }}" target="_blank" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700">Share on WhatsApp</a>
-    </div>
-  </div>
+  <section class="deal-bar reveal-block"><div><div class="card-kicker">MAKE IT A PLAN</div><h2>Deals, booking & sharing</h2><p>Go from insight to dinner without leaving the field guide.</p></div><div class="deal-actions"><a class="deal swiggy magnetic" href="{{ deals.swiggy_dineout }}" target="_blank">Swiggy Dineout ↗</a><a class="deal zomato magnetic" href="{{ deals.zomato_gold }}" target="_blank">Zomato ↗</a><a class="deal whatsapp magnetic" href="{{ wa_url }}" target="_blank">Share ↗</a></div></section>
 </div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+  document.querySelectorAll('.reveal-block').forEach((el,i)=>el.style.setProperty('--d',`${i*55}ms`));
+  if(window.anime){anime.animate('.restaurant-page .reveal-block',{opacity:[0,1],y:[26,0],duration:900,delay:anime.stagger(80),ease:'out(4)'});anime.animate('.hero-score strong',{scale:[.75,1],opacity:[0,1],duration:1000,delay:350,ease:'outExpo'})}
+  document.querySelectorAll('.magnetic').forEach(el=>{if(!matchMedia('(pointer:fine)').matches)return;el.addEventListener('pointermove',e=>{const r=el.getBoundingClientRect();const x=(e.clientX-r.left-r.width/2)*.12;const y=(e.clientY-r.top-r.height/2)*.12;el.style.transform=`translate(${x}px,${y}px)`});el.addEventListener('pointerleave',()=>el.style.transform='')});
+});
+</script>
 {% endblock %}

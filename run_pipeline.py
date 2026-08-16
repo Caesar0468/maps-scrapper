@@ -24,7 +24,7 @@ def seed_sample_data() -> list[dict[str, Any]]:
         try:
             return json.loads(SAMPLE_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            pass  # fall through to hard‑coded samples if file is corrupt
+            pass
 
     return [
         {
@@ -104,7 +104,6 @@ def run_full_pipeline(
         if progress_callback:
             progress_callback(payload)
 
-    # Helper to wrap callbacks from lower‑level modules with a stage
     def make_callback(stage: str):
         def cb(data: dict[str, Any]):
             if progress_callback:
@@ -126,12 +125,19 @@ def run_full_pipeline(
         )
         report("scrape", message=f"Scraped {len(places)} places")
 
-    # Social contexts keyed by index to avoid duplicate‑name collisions
     social_contexts: dict[int, dict] = {}
     if not skip_social:
         report("social", message="Scouring Reddit & DuckDuckGo")
         for idx, place in enumerate(places):
             try:
+                if progress_callback:
+                    progress_callback({
+                        "stage": "social",
+                        "current": idx + 1,
+                        "total": len(places),
+                        "name": place.get("name", ""),
+                        "message": f"Scouring social for {place.get('name', '')} ({idx+1}/{len(places)})"
+                    })
                 result = scour_restaurant(place)
                 social_contexts[idx] = result.get("social_context", {})
             except Exception as exc:
