@@ -1,0 +1,24 @@
+# Virtual environments
+venv/
+**/venv/
+ENV/
+env/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# SQLite WAL and temp files (keep restaurants.db if you want to publish the dataset)
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Playwright & browser downloads
+.playwright/
