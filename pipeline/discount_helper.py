@@ -33,9 +33,11 @@ def whatsapp_share_text(restaurant: dict) -> str:
         except Exception:
             ai = {}
 
+    # FIX: handle None review_count
+    review_count = restaurant.get('review_count') or 0
     lines = [
         f"🍽️ *{restaurant.get('name')}* — {restaurant.get('locality', 'Hyderabad')}",
-        f"⭐ {restaurant.get('rating', 'N/A')} ({restaurant.get('review_count', 0):,} reviews)",
+        f"⭐ {restaurant.get('rating', 'N/A')} ({review_count:,} reviews)",
         f"💰 ~₹{ai.get('calculated_spend_for_two', '?')} for two ({ai.get('budget_tier', '')})",
         f"🔥 Hype: {ai.get('hype_verdict', 'N/A')} (Score: {ai.get('hype_score', '?')}/100)",
         f"🥗 Dietary: {ai.get('dietary_warning', 'None')}",

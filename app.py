@@ -44,10 +44,8 @@ async def index(request: Request):
     conn = get_db()
     localities = db.get_localities(conn)
     conn.close()
-    return TEMPLATES.TemplateResponse(
-        "index.html",
-        {"request": request, "localities": localities},
-    )
+    # FIX: request must be first argument
+    return TEMPLATES.TemplateResponse(request, "index.html", {"localities": localities})
 
 
 @app.get("/restaurant/{slug}", response_class=HTMLResponse)
@@ -62,10 +60,11 @@ async def restaurant_profile(request: Request, slug: str):
     wa_url = whatsapp_share_url(restaurant)
     wa_text = whatsapp_share_text(restaurant)
 
+    # FIX: request must be first argument
     return TEMPLATES.TemplateResponse(
+        request,
         "restaurant.html",
         {
-            "request": request,
             "r": restaurant,
             "deals": deals,
             "wa_url": wa_url,
@@ -133,8 +132,9 @@ def _apply_filters(
         if low_fake_risk and ai.get("fake_review_risk") != "Low":
             continue
 
-        spend = ai.get("calculated_spend_for_two", 0)
-        if spend and (spend < budget_min or spend > budget_max):
+        # FIX: budget filter – always apply range; missing spend defaults to 0
+        spend = ai.get("calculated_spend_for_two", 0) or 0
+        if spend < budget_min or spend > budget_max:
             continue
 
         if vibe:
@@ -303,14 +303,22 @@ async def run_pipeline_api(
         finally:
             _pipeline_state["running"] = False
 
+    # FIX: Acquire lock and check again to avoid race condition
     if _pipeline_lock.acquire(blocking=False):
         threading.Thread(target=_run, daemon=True).start()
         _pipeline_lock.release()
+        return JSONResponse({"message": "Pipeline started", "status": _pipeline_state})
+    else:
+        return JSONResponse({"message": "Pipeline already starting"}, status_code=409)
 
-    return JSONResponse({"message": "Pipeline started", "status": _pipeline_state})
 
-
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+# Make static mount safe – skip if directory doesn't exist (optional)
+static_dir = BASE_DIR / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+else:
+    import logging
+    logging.warning("Static directory not found; skipping mount. Create 'static/' to serve CSS/JS.")
 
 
 if __name__ == "__main__":

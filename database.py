@@ -68,13 +68,12 @@ def init_db(db_path: Path | None = None) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_restaurants_slug ON restaurants(slug);
         CREATE INDEX IF NOT EXISTS idx_restaurants_coords ON restaurants(latitude, longitude);
 
+        -- FIX: Removed content and content_rowid – we sync manually via _fts_sync
         CREATE VIRTUAL TABLE IF NOT EXISTS restaurants_fts USING fts5(
             name,
             locality,
             cuisines,
             must_try_items,
-            content='restaurants',
-            content_rowid='id',
             tokenize='porter unicode61'
         );
         """
@@ -92,8 +91,8 @@ def _fts_sync(conn: sqlite3.Connection, row_id: int) -> None:
         ai = json.loads(row["ai_analysis_json"] or "{}")
     except json.JSONDecodeError:
         pass
-    cuisines = ", ".join(ai.get("cuisines", []))
-    must_try = ", ".join(ai.get("must_try_items", []))
+    cuisines = ", ".join(ai.get("cuisines", [])) if ai.get("cuisines") else ""
+    must_try = ", ".join(ai.get("must_try_items", [])) if ai.get("must_try_items") else ""
     conn.execute("DELETE FROM restaurants_fts WHERE rowid=?", (row_id,))
     conn.execute(
         "INSERT INTO restaurants_fts(rowid, name, locality, cuisines, must_try_items) VALUES (?,?,?,?,?)",
@@ -197,11 +196,12 @@ def get_restaurant_by_slug(conn: sqlite3.Connection, slug: str) -> dict[str, Any
 
 
 def search_restaurants(conn: sqlite3.Connection, query: str, limit: int = 50) -> list[dict[str, Any]]:
+    # FIX: use alias 'fts' instead of table name
     rows = conn.execute(
         """
         SELECT r.* FROM restaurants r
         JOIN restaurants_fts fts ON r.id = fts.rowid
-        WHERE restaurants_fts MATCH ?
+        WHERE fts MATCH ?
         ORDER BY rank LIMIT ?
         """,
         (query, limit),
