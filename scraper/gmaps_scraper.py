@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote_plus, unquote
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_playwright
 from config.targets import MIN_RATING, MIN_REVIEWS
 from scraper.grid_generator import generate_search_targets
@@ -21,22 +21,22 @@ COORD_3D4D_RE = re.compile(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)")
 PLACE_ID_RE = re.compile(r"(ChIJ[a-zA-Z0-9_-]+)")
 PHONE_RE = re.compile(r"(?:\+91[\s-]?)?(?:\(?0?\d{2,4}\)?[\s-]?)?\d{4}[\s-]?\d{4,6}")
 
-def random_delay(min_s: float = 0.4, max_s: float = 1.0) -> None:
+def random_delay(min_s: float = 0.4, max_s: float = 0.8) -> None:
     time.sleep(random.uniform(min_s, max_s))
 
 def dismiss_overlays(page: Page) -> None:
     try:
         close_drawer = page.locator('button[aria-label="Close"], button[jsaction*="drawer.close"]').first
-        if close_drawer.is_visible(timeout=600):
+        if close_drawer.is_visible(timeout=500):
             close_drawer.click()
     except Exception:
         pass
     for text in ("Accept all", "Reject all", "I agree", "Agree"):
         try:
             btn = page.locator(f'button:has-text("{text}")').first
-            if btn.is_visible(timeout=600):
+            if btn.is_visible(timeout=500):
                 btn.click()
-                random_delay(0.3, 0.5)
+                random_delay(0.2, 0.4)
                 break
         except Exception:
             pass
@@ -95,7 +95,7 @@ def dedupe_key(name: str, place_id: str | None, lat: float, lng: float) -> str:
         return f"id:{place_id}"
     return f"coord:{name.strip().lower()}:{round(lat,4)}:{round(lng,4)}"
 
-def scroll_feed(page: Page, max_scrolls: int = 30) -> None:
+def scroll_feed(page: Page, max_scrolls: int = 25) -> None:
     feed = page.locator('div[role="feed"], div[aria-label*="Results"], .m6QErb[aria-label]').first
     if feed.count() == 0:
         return
@@ -106,12 +106,12 @@ def scroll_feed(page: Page, max_scrolls: int = 30) -> None:
     for _ in range(max_scrolls):
         try:
             end_msg = page.locator('text="You\'ve reached the end of the list"').first
-            if end_msg.is_visible(timeout=400):
+            if end_msg.is_visible(timeout=300):
                 break
         except Exception:
             pass
 
-        cards = page.locator('div[role="feed"] > div > div[jsaction], div.Nv2PK')
+        cards = page.locator('div.Nv2PK')
         current_count = cards.count()
 
         if current_count == last_card_count:
@@ -125,19 +125,19 @@ def scroll_feed(page: Page, max_scrolls: int = 30) -> None:
 
         try:
             feed.evaluate("el => el.scrollBy(0, 5000)")
-            random_delay(0.5, 0.9)
+            random_delay(0.4, 0.7)
         except Exception:
             break
 
 def parse_list_cards(page: Page, locality: str, fallback: tuple[float, float]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    cards = page.locator('div[role="feed"] > div > div[jsaction], div[aria-label*="Results"] > div > div[jsaction], div.Nv2PK')
+    cards = page.locator('div.Nv2PK, div[role="feed"] > div > div[jsaction]')
     count = cards.count()
 
     for i in range(count):
         try:
             card = cards.nth(i)
-            link = card.locator('a[href*="/maps/place/"]').first
+            link = card.locator('a.hfpxzc, a[href*="/maps/place/"]').first
             if link.count() == 0:
                 continue
 
@@ -146,27 +146,27 @@ def parse_list_cards(page: Page, locality: str, fallback: tuple[float, float]) -
                 href = f"https://www.google.com{href}"
 
             name = ""
-            name_el = card.locator('.fontHeadlineSmall, [class*="fontHeadline"]').first
+            name_el = card.locator('.qBF1Pd, .fontHeadlineSmall, [class*="fontHeadline"]').first
             if name_el.count() > 0:
-                name = name_el.inner_text(timeout=600).strip()
+                name = name_el.inner_text(timeout=400).strip()
             if not name:
                 aria = link.get_attribute("aria-label") or ""
                 name = aria.split("\n")[0].strip()
             if not name:
                 continue
 
-            card_text = card.inner_text(timeout=600)
+            card_text = card.inner_text(timeout=400)
             rating = None
-            rating_el = card.locator('span.MW4etd, span[class*="rating"]').first
+            rating_el = card.locator('span.MW4etd, span.ZkP5Je').first
             if rating_el.count() > 0:
-                rating = parse_rating(rating_el.inner_text(timeout=300))
+                rating = parse_rating(rating_el.inner_text(timeout=200))
             if rating is None:
                 rating = parse_rating(card_text)
 
             reviews = None
-            review_el = card.locator('span.UY7F9, span[class*="reviews"]').first
+            review_el = card.locator('span.UY7F9, span.RDAAZb').first
             if review_el.count() > 0:
-                reviews = parse_review_count(review_el.inner_text(timeout=300))
+                reviews = parse_review_count(review_el.inner_text(timeout=200))
             if reviews is None:
                 reviews = parse_review_count(card_text)
 
@@ -201,9 +201,9 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
     result["metadata_sources"] = metadata_sources
 
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
         dismiss_overlays(page)
-        random_delay(0.5, 1.0)
+        random_delay(0.4, 0.7)
     except Exception as exc:
         result["scrape_error"] = str(exc)
         return result
@@ -213,7 +213,7 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
 
     body_text = ""
     try:
-        body_text = page.locator('[role="main"]').inner_text(timeout=1500)
+        body_text = page.locator('[role="main"]').inner_text(timeout=1200)
     except Exception:
         pass
 
@@ -222,7 +222,7 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
         try:
             el = page.locator(selector).first
             if el.count() > 0:
-                addr = el.inner_text(timeout=600).strip()
+                addr = el.inner_text(timeout=400).strip()
                 if addr:
                     result["address"] = addr
                     metadata_sources["address"] = {"value": addr, "source": "Google Maps Place Header"}
@@ -235,7 +235,7 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
         try:
             el = page.locator(selector).first
             if el.count() > 0:
-                raw = el.inner_text(timeout=600) or el.get_attribute("href") or ""
+                raw = el.inner_text(timeout=400) or el.get_attribute("href") or ""
                 match = PHONE_RE.search(raw.replace("tel:", "").strip())
                 if match:
                     phone = match.group(0).strip()
@@ -258,16 +258,16 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
         except Exception:
             continue
 
-    # Hours & Open-Now
+    # Hours
     hours: list[str] = []
     try:
         hours_btn = page.locator('button[aria-label*="Hours"], button[data-item-id="oh"]').first
         if hours_btn.count() > 0:
-            hours_btn.click(timeout=800)
-            random_delay(0.2, 0.4)
+            hours_btn.click(timeout=600)
+            random_delay(0.2, 0.3)
             hour_rows = page.locator('table tr, div[aria-label*="hours"] div')
             for j in range(min(hour_rows.count(), 14)):
-                row_text = hour_rows.nth(j).inner_text(timeout=300).strip()
+                row_text = hour_rows.nth(j).inner_text(timeout=200).strip()
                 if row_text and len(row_text) < 80:
                     hours.append(row_text)
             metadata_sources["opening_hours"] = {"value": hours, "source": "Google Maps Hours Panel"}
@@ -293,28 +293,42 @@ def extract_place_details(page: Page, listing: dict[str, Any]) -> dict[str, Any]
 def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, Any]]:
     name = str(target["name"])
     lat, lon = float(target["lat"]), float(target["lon"])
-    url = f"https://www.google.com/maps/search/restaurants/@{lat},{lon},15z"
+    query_str = f"restaurants near {name}, Hyderabad"
+    url = f"https://www.google.com/maps/search/{quote_plus(query_str)}"
     print(f"\n📍 Scanning {target['type']}: {name}")
 
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(url, wait_until="domcontentloaded", timeout=35000)
         dismiss_overlays(page)
         random_delay(0.8, 1.4)
 
-        feed_selector = 'div[role="feed"], div[aria-label*="Results"], .m6QErb[aria-label]'
+        # Handle Locality Page redirect: Click "Nearby restaurants" chip if present
+        if "/maps/place/" in page.url:
+            for chip_text in ("Nearby restaurants", "Restaurants", "Food"):
+                try:
+                    chip = page.locator(f'button:has-text("{chip_text}")').first
+                    if chip.is_visible(timeout=1500):
+                        chip.click()
+                        random_delay(1.0, 1.6)
+                        break
+                except Exception:
+                    pass
+
+        feed_selector = 'div.Nv2PK, div[role="feed"], div[aria-label*="Results"]'
         feed_found = False
 
         try:
-            page.wait_for_selector(feed_selector, timeout=5000)
+            page.wait_for_selector(feed_selector, timeout=8000)
             feed_found = True
         except Exception:
             search_box = page.locator('input#searchboxinput, input[name="q"]').first
             if search_box.is_visible(timeout=2000):
-                search_box.fill(f"Restaurants in {name} Hyderabad")
+                search_box.click()
+                search_box.fill(query_str)
                 search_box.press("Enter")
-                random_delay(1.2, 2.0)
+                random_delay(1.2, 1.8)
                 try:
-                    page.wait_for_selector(feed_selector, timeout=6000)
+                    page.wait_for_selector(feed_selector, timeout=8000)
                     feed_found = True
                 except Exception:
                     feed_found = False
@@ -339,7 +353,7 @@ def scrape_target(page: Page, target: dict[str, str | float]) -> list[dict[str, 
         print(f"    [{idx}/{len(listings)}] Details: {listing['name']} ({listing['rating']}★, {listing['review_count']:,} reviews)...")
         try:
             detailed.append(extract_place_details(page, listing))
-            random_delay(0.4, 0.7)
+            random_delay(0.3, 0.6)
         except Exception as exc:
             listing["scrape_error"] = str(exc)
             detailed.append(listing)
@@ -365,6 +379,14 @@ def run_scraper(
             locale="en-IN",
         )
         page = context.new_page()
+
+        # Warm-up navigation
+        try:
+            page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=20000)
+            dismiss_overlays(page)
+            random_delay(0.8, 1.2)
+        except Exception:
+            pass
 
         for idx, target in enumerate(targets, start=1):
             if progress_callback:
